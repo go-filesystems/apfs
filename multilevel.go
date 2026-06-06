@@ -1361,6 +1361,23 @@ func (v *Volume) refreshRoot(rootPaddr uint64) error {
 		return nil
 	}
 	bs := v.physicalBlockSize()
+	// First sweep: prune any subtree whose every reachable leaf is
+	// empty. Per-leaf deletes leave empty leaves in place (their
+	// blocks aren't freed; the writer doesn't yet track FS-tree
+	// frees), so without this pass `leftmostKeyInSubtree` would
+	// stumble into one of them when rebuilding the root index. The
+	// pruner rewrites internal nodes in place when their TOC changes,
+	// so reload the in-memory root before reading it below.
+	rootXIDForPrune := v.rootNode.hdr.xid
+	if _, err := v.pruneEmptySubtreeChildren(rootPaddr, true, rootXIDForPrune); err != nil {
+		return fmt.Errorf("apfs: refreshRoot: prune: %w", err)
+	}
+	if err := v.reloadRoot(rootPaddr); err != nil {
+		return fmt.Errorf("apfs: refreshRoot: reload after prune: %w", err)
+	}
+	if v.rootNode.IsLeaf() {
+		return nil
+	}
 	r, err := newNodeReader(v.rootNode, v.rootInfo)
 	if err != nil {
 		return err
@@ -1375,6 +1392,19 @@ func (v *Volume) refreshRoot(rootPaddr uint64) error {
 		childPaddr, err := v.c.omapLookup(v.volOmap, childOID, v.xidLimit)
 		if err != nil {
 			return fmt.Errorf("apfs: refreshRoot: resolve child %d: %w", childOID, err)
+		}
+		// A child subtree may be empty after a delete cascade — e.g.
+		// `removeKeyFromLeaf` rewrites a leaf in place and the last
+		// surviving entry was the one we just removed. The empty leaf
+		// is still pointed at by the root index, but it carries no
+		// keys, so `leftmostKeyInSubtree` would fail. Drop the empty
+		// child from the rebuilt root index instead (the block is left
+		// allocated for now; the writer does not yet track per-block
+		// frees from the FS-tree itself).
+		if isEmpty, ierr := v.isSubtreeEmpty(childPaddr); ierr != nil {
+			return fmt.Errorf("apfs: refreshRoot: probe child %d: %w", childOID, ierr)
+		} else if isEmpty {
+			continue
 		}
 		// First key reachable through this child = leftmost key in its
 		// subtree. For a leaf child it's just keyAt(0); for an internal
@@ -1391,6 +1421,21 @@ func (v *Volume) refreshRoot(rootPaddr uint64) error {
 	// Sort by key so the index stays in canonical FS-key order.
 	sortLeafEntries(rootEntries)
 	rootXID := v.rootNode.hdr.xid
+	// All children turned out to be empty: collapse the root back to a
+	// single empty leaf. This restores the invariant that the tree is
+	// always traversable (the empty-leaf path through lookupFSTreeFirst
+	// returns os.ErrNotExist) without leaving the root pointing at
+	// stale, empty internal subtrees.
+	if len(rootEntries) == 0 {
+		emptyLeaf, err := emitFSTreeLeafExplicit(nil, int(bs), v.apsb.rootTreeOID, rootXID)
+		if err != nil {
+			return fmt.Errorf("apfs: refreshRoot: emit empty leaf: %w", err)
+		}
+		if _, werr := v.c.w.WriteAt(emptyLeaf, int64(rootPaddr*bs)); werr != nil {
+			return fmt.Errorf("apfs: refreshRoot: write empty leaf: %w", werr)
+		}
+		return v.reloadRoot(rootPaddr)
+	}
 	longestKey, longestVal := v.computeTreeLongestKV(nil)
 	keyCount, nodeCount, err := v.computeTreeCounts(rootEntries)
 	if err != nil {
@@ -1411,6 +1456,160 @@ func (v *Volume) refreshRoot(rootPaddr uint64) error {
 		return fmt.Errorf("apfs: refreshRoot: emit: %w", err)
 	}
 	return v.promoteRoot(rootEntries, rootPaddr, rootXID, v.rootNode.level)
+}
+
+// pruneEmptySubtreeChildren rewrites the internal node at `paddr` so
+// that its child-OID index no longer references any subtree whose
+// every reachable leaf is empty. The traversal is post-order: each
+// child is descended into first (so internal grandchildren are
+// pruned before we judge whether their parent is "empty"), then the
+// current node's TOC is rebuilt from the surviving children. Used by
+// refreshRoot to clean up empty branches left behind by per-leaf
+// deletes that exhaust an entire subtree.
+//
+// Returns true when, after pruning, the node itself has zero
+// surviving entries (i.e. the entire subtree under `paddr` was
+// empty). Callers that own this node should drop their reference to
+// it in that case; the orphaned block is not reclaimed (the writer
+// does not yet track per-block frees outside the spaceman).
+func (v *Volume) pruneEmptySubtreeChildren(paddr uint64, isRoot bool, rootXID uint64) (allEmpty bool, err error) {
+	bs := v.physicalBlockSize()
+	raw, err := v.c.readBlock(paddr)
+	if err != nil {
+		return false, err
+	}
+	node, err := readBTreeNode(raw)
+	if err != nil {
+		return false, err
+	}
+	if node.IsLeaf() {
+		return node.nKeys == 0, nil
+	}
+	var info *btreeInfo
+	if isRoot {
+		info, err = readRootBTreeInfo(raw)
+		if err != nil {
+			return false, err
+		}
+	}
+	r, err := newNodeReader(node, info)
+	if err != nil {
+		return false, err
+	}
+	var survivors []fsLeafKV
+	dirty := false
+	for i := 0; i < r.EntryCount(); i++ {
+		k, kerr := r.keyAt(i)
+		if kerr != nil {
+			return false, kerr
+		}
+		val, verr := r.valueAt(i)
+		if verr != nil {
+			return false, verr
+		}
+		childOID := binary.LittleEndian.Uint64(val[0:8])
+		childPaddr, oerr := v.c.omapLookup(v.volOmap, childOID, v.xidLimit)
+		if oerr != nil {
+			return false, fmt.Errorf("apfs: prune: resolve child %d: %w", childOID, oerr)
+		}
+		// Recurse: prune the child's own empty subtrees first, then
+		// decide whether to keep or drop the link from this node.
+		childEmpty, perr := v.pruneEmptySubtreeChildren(childPaddr, false, rootXID)
+		if perr != nil {
+			return false, perr
+		}
+		if childEmpty {
+			dirty = true
+			continue
+		}
+		// Re-read the child's leftmost key — pruning grandchildren may
+		// have shifted the minimum key on this child even though the
+		// child itself isn't empty. Without this refresh the parent's
+		// stored index key could be larger than the child's actual new
+		// minimum, breaking binary-search descent.
+		newLeftmost, lerr := v.leftmostKeyInSubtree(childPaddr)
+		if lerr != nil {
+			return false, fmt.Errorf("apfs: prune: leftmost in surviving child %d: %w", childOID, lerr)
+		}
+		if !bytesEqual(k, newLeftmost) {
+			dirty = true
+		}
+		survivors = append(survivors, fsLeafKV{
+			key: append([]byte(nil), newLeftmost...),
+			val: append([]byte(nil), val[:8]...),
+		})
+	}
+	if !dirty {
+		return false, nil
+	}
+	if len(survivors) == 0 {
+		// The non-root internal node lost every reference. Caller
+		// will drop us from its TOC; we don't rewrite the block.
+		if !isRoot {
+			return true, nil
+		}
+		// Root case: collapse to an empty leaf so the tree remains
+		// traversable. Caller (refreshRoot) handles the collapse, so
+		// just return; the survivor list is already empty.
+		return true, nil
+	}
+	sortLeafEntries(survivors)
+	block, err := emitFSTreeInternalExplicit(survivors, int(bs), node.hdr.oid, rootXID, node.level, isRoot, 0, 0, 0, 0)
+	if err != nil {
+		return false, fmt.Errorf("apfs: prune: emit internal at level %d: %w", node.level, err)
+	}
+	if _, err := v.c.w.WriteAt(block, int64(paddr*bs)); err != nil {
+		return false, fmt.Errorf("apfs: prune: write internal at level %d: %w", node.level, err)
+	}
+	return false, nil
+}
+
+// isSubtreeEmpty reports whether every leaf reachable from the
+// subtree rooted at `paddr` carries zero keys. Used by refreshRoot to
+// prune child entries whose payload has been entirely deleted, so the
+// rebuilt root index doesn't reference an empty leaf or an internal
+// node whose every descent ends at an empty leaf. Mirrors the
+// leftmost-descent shape of `leftmostKeyInSubtree`; an internal node
+// counts as empty only if EVERY child is empty (we recurse into all
+// children at each level), which is the only configuration the writer
+// can produce today.
+func (v *Volume) isSubtreeEmpty(paddr uint64) (bool, error) {
+	raw, err := v.c.readBlock(paddr)
+	if err != nil {
+		return false, err
+	}
+	node, err := readBTreeNode(raw)
+	if err != nil {
+		return false, err
+	}
+	if node.IsLeaf() {
+		return node.nKeys == 0, nil
+	}
+	if node.nKeys == 0 {
+		return true, nil
+	}
+	r, err := newNodeReader(node, nil)
+	if err != nil {
+		return false, err
+	}
+	for i := 0; i < r.EntryCount(); i++ {
+		childOID, err := r.childOIDAt(i)
+		if err != nil {
+			return false, err
+		}
+		childPaddr, err := v.c.omapLookup(v.volOmap, childOID, v.xidLimit)
+		if err != nil {
+			return false, err
+		}
+		empty, err := v.isSubtreeEmpty(childPaddr)
+		if err != nil {
+			return false, err
+		}
+		if !empty {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // leftmostKeyInSubtree returns the first key reachable through the
@@ -1489,6 +1688,15 @@ func (v *Volume) promoteRoot(entries []fsLeafKV, rootPaddr, leafXID uint64, oldL
 	if len(entries) < 2 {
 		return fmt.Errorf("apfs: promoteRoot: too few entries to split (%d)", len(entries))
 	}
+	// Callers from `modifyLeafAtPaddrAndInsert` build `entries` by
+	// `readAllInternalEntries` + an in-place key update + an append, so
+	// the slice is not guaranteed to be in canonical key order on entry.
+	// `leftmostKeyInSubtree` below trusts that left[]/right[] are stored
+	// in ascending key order on the new internal nodes, so the parent
+	// index key we pick (the leftmost descendant) describes them
+	// correctly. Sort once here so the index-midpoint split is
+	// deterministic and the resulting subtrees are validly ordered.
+	sortLeafEntries(entries)
 	mid := len(entries) / 2
 	left := entries[:mid]
 	right := entries[mid:]
@@ -1583,6 +1791,84 @@ type childInfo struct {
 	oid   uint64
 	paddr uint64
 	idx   int // position in the parent's TOC
+}
+
+// internalNodeRef identifies one internal (non-leaf) node on the
+// descent path from root to a leaf, plus the position within that
+// node's TOC of the child we followed. Used by descent helpers that
+// need to update the index keys all the way back up after a leaf
+// split.
+type internalNodeRef struct {
+	paddr uint64 // physical address of the internal node
+	oid   uint64 // virtual oid (volume-OMAP key)
+	idx   int    // TOC index of the child we followed from this node
+}
+
+// descendToLeafPath returns the full chain of internal nodes traversed
+// from the FS-tree root to the leaf that would hold `targetKey`. The
+// path is returned root-first (path[0] = root, path[len-1] = the
+// immediate parent of the leaf). The leaf itself is returned via
+// `leafPaddr`/`leafOID`. Errors out when the tree is a single-leaf
+// root (the caller should use the in-place / split-root path).
+func (v *Volume) descendToLeafPath(targetKey []byte) (leafPaddr, leafOID uint64, path []internalNodeRef, err error) {
+	if v.rootNode.IsLeaf() {
+		return 0, 0, nil, fmt.Errorf("apfs: descend: tree is single-leaf")
+	}
+	// The root has no enclosing parent — we know its paddr from the
+	// volume OMAP, but reuse the value that's already cached on the
+	// container (apsb.rootTreeOID via omapLookup).
+	rootPaddr, err := v.c.omapLookup(v.volOmap, v.apsb.rootTreeOID, v.xidLimit)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("apfs: descend: resolve fs-tree root: %w", err)
+	}
+	curNode := v.rootNode
+	curInfo := v.rootInfo
+	curPaddr := rootPaddr
+	curOID := v.apsb.rootTreeOID
+	for !curNode.IsLeaf() {
+		r, err := newNodeReader(curNode, curInfo)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		nKeys := r.EntryCount()
+		if nKeys == 0 {
+			return 0, 0, nil, fmt.Errorf("apfs: descend: empty index node at level %d", curNode.level)
+		}
+		idx := 0
+		for i := 0; i < nKeys; i++ {
+			k, kerr := r.keyAt(i)
+			if kerr != nil {
+				return 0, 0, nil, kerr
+			}
+			if compareFSKey(k, targetKey) <= 0 {
+				idx = i
+			} else {
+				break
+			}
+		}
+		childOID, err := r.childOIDAt(idx)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		childPaddr, err := v.c.omapLookup(v.volOmap, childOID, v.xidLimit)
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("apfs: descend: resolve child oid %d: %w", childOID, err)
+		}
+		path = append(path, internalNodeRef{paddr: curPaddr, oid: curOID, idx: idx})
+		childRaw, err := v.c.readBlock(childPaddr)
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("apfs: descend: read child block at %d: %w", childPaddr, err)
+		}
+		nextNode, err := readBTreeNode(childRaw)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		curNode = nextNode
+		curInfo = nil
+		curPaddr = childPaddr
+		curOID = childOID
+	}
+	return curPaddr, curOID, path, nil
 }
 
 // descendToLeafForKey walks the FS-tree from the root to the leaf that
@@ -1789,65 +2075,192 @@ func (v *Volume) modifyLeafAtPaddrAndInsert(leafPaddr, leafOID, leafXID uint64, 
 		return fmt.Errorf("apfs: splitLeaf: omap right: %w", err)
 	}
 
-	// Update the root index node: replace the existing entry's key with
-	// left[0].key (in case it changed), and insert (right[0].key,
-	// rightOID) as a new entry.
-	rootEntries, err := v.readAllInternalEntries()
-	if err != nil {
-		return fmt.Errorf("apfs: splitLeaf: read root: %w", err)
-	}
-	// Find the entry pointing at leafOID and update its key (the leftmost
-	// key of the leaf may have changed if the new keys sort below the
-	// previous minimum).
-	for i := range rootEntries {
-		oid := binary.LittleEndian.Uint64(rootEntries[i].val[0:8])
-		if oid == leafOID {
-			rootEntries[i].key = append([]byte(nil), left[0].key...)
-			break
-		}
-	}
-	rootEntries = append(rootEntries, fsLeafKV{
-		key: append([]byte(nil), right[0].key...),
-		val: encodeChildOIDValue(rightOID),
-	})
+	// Add the new right leaf entry to the leaf's IMMEDIATE parent
+	// internal node. In a 2-level tree the parent IS the root, but in
+	// deeper trees the parent is at level 1 and the root sits above it
+	// — putting the new leaf entry directly into the root would skip
+	// the intermediate level and produce a structurally invalid tree
+	// (root child OIDs would point to leaves in some entries and to
+	// internal nodes in others). We re-descend with left[0].key so we
+	// can locate the immediate parent for any tree level, then propagate
+	// any cascade splits back up to the root.
 	rootXID := v.rootNode.hdr.xid
-	// If the root's would-be entries don't fit even at level=current,
-	// promote the root one level (level → level+1). This handles the
-	// 1→2 transition when the level-1 root overflows after a leaf split.
-	if !leafFitsCheck(rootEntries, int(bs), true) {
-		return v.promoteRoot(rootEntries, rootPaddr, rootXID, v.rootNode.level)
-	}
-	// Two-pass write: placeholder counts in the first pass so we can
-	// reload + descend through the *new* root (which sees both the
-	// old-paddr leaf carrying the LEFT half AND the freshly-allocated
-	// right paddr); then a second emit with the correct tree-wide
-	// `bt_longest_key` / `bt_longest_val` / `bt_key_count` / `bt_node_count`.
-	// One-pass would require descending the new structure without
-	// rewriting v.rootNode, which is more code for the same result.
-	placeholderRoot, err := emitFSTreeInternalExplicit(rootEntries, int(bs), v.apsb.rootTreeOID, rootXID, v.rootNode.level, true, 0, 0, 0, 0)
+	leafParentLeftKey := append([]byte(nil), left[0].key...)
+	leafParentRightKey := append([]byte(nil), right[0].key...)
+	return v.insertSiblingIntoParent(leafParentLeftKey, leafOID, leafParentRightKey, rightOID, rootXID, rootPaddr)
+}
+
+// insertSiblingIntoParent updates the immediate-parent internal node
+// of a freshly-split leaf so that the parent's index has:
+//
+//   - the existing entry for `leftChildOID` rewritten to use
+//     `leftFirstKey` as its index key (left[0] of the rewritten leaf),
+//   - a new entry (rightFirstKey, rightChildOID) for the freshly
+//     allocated right sibling.
+//
+// If the parent overflows after the insertion, the parent itself is
+// split and the propagation continues one level up. When the cascade
+// reaches the root and the root overflows, the root is promoted via
+// `promoteRoot`. After every successful update the FS-tree root's
+// metadata is refreshed so the in-memory cached root sees the new
+// shape.
+//
+// The function tolerates any tree depth from level 1 (single root +
+// leaves) to arbitrarily deep multi-level trees.
+func (v *Volume) insertSiblingIntoParent(leftFirstKey []byte, leftChildOID uint64, rightFirstKey []byte, rightChildOID uint64, rootXID, rootPaddr uint64) error {
+	bs := v.physicalBlockSize()
+	// Use the right sibling's first key to locate the immediate parent
+	// node — descent picks the rightmost entry whose index key ≤ target,
+	// and right's first key currently still resolves into the leaf we
+	// just split (since the parent index hasn't been updated yet).
+	_, _, path, err := v.descendToLeafPath(rightFirstKey)
 	if err != nil {
-		return fmt.Errorf("apfs: splitLeaf: emit placeholder root: %w", err)
+		return fmt.Errorf("apfs: splitLeaf: descend for parent: %w", err)
 	}
-	if _, err := v.c.w.WriteAt(placeholderRoot, int64(rootPaddr*bs)); err != nil {
-		return fmt.Errorf("apfs: splitLeaf: write placeholder root: %w", err)
+	if len(path) == 0 {
+		return fmt.Errorf("apfs: splitLeaf: empty internal path")
 	}
-	if err := v.reloadRoot(rootPaddr); err != nil {
-		return fmt.Errorf("apfs: splitLeaf: reload root: %w", err)
+	// Walk path from leaf-parent (last) up to root (first).
+	curLeftKey := append([]byte(nil), leftFirstKey...)
+	curLeftOID := leftChildOID
+	curRightKey := append([]byte(nil), rightFirstKey...)
+	curRightOID := rightChildOID
+	for level := len(path) - 1; level >= 0; level-- {
+		ref := path[level]
+		isRoot := level == 0
+		// Read the internal node's current entries.
+		rawNode, err := v.c.readBlock(ref.paddr)
+		if err != nil {
+			return fmt.Errorf("apfs: splitLeaf: read internal at %d: %w", ref.paddr, err)
+		}
+		node, err := readBTreeNode(rawNode)
+		if err != nil {
+			return err
+		}
+		var info *btreeInfo
+		if isRoot {
+			info, err = readRootBTreeInfo(rawNode)
+			if err != nil {
+				return err
+			}
+		}
+		r, err := newNodeReader(node, info)
+		if err != nil {
+			return err
+		}
+		entries := make([]fsLeafKV, 0, r.EntryCount()+1)
+		for i := 0; i < r.EntryCount(); i++ {
+			k, kerr := r.keyAt(i)
+			if kerr != nil {
+				return kerr
+			}
+			val, verr := r.valueAt(i)
+			if verr != nil {
+				return verr
+			}
+			entries = append(entries, fsLeafKV{
+				key: append([]byte(nil), k...),
+				val: append([]byte(nil), val[:8]...),
+			})
+		}
+		// Update the existing entry pointing at curLeftOID, and add a
+		// new entry for curRightOID.
+		updated := false
+		for i := range entries {
+			oid := binary.LittleEndian.Uint64(entries[i].val[0:8])
+			if oid == curLeftOID {
+				entries[i].key = append([]byte(nil), curLeftKey...)
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			return fmt.Errorf("apfs: splitLeaf: parent at level %d does not reference child oid %d", node.level, curLeftOID)
+		}
+		entries = append(entries, fsLeafKV{
+			key: append([]byte(nil), curRightKey...),
+			val: encodeChildOIDValue(curRightOID),
+		})
+		sortLeafEntries(entries)
+
+		// In-place fit?
+		if leafFitsCheck(entries, int(bs), isRoot) {
+			var block []byte
+			if isRoot {
+				longestKey, longestVal := v.computeTreeLongestKV(nil)
+				// Use placeholder counts for the first emit; refreshRoot
+				// at the end recomputes accurate totals. We're already
+				// touching the in-memory rootNode, so a single emit is
+				// enough to make the tree traversable for the recount.
+				block, err = emitFSTreeInternalExplicit(entries, int(bs), ref.oid, rootXID, node.level, true, longestKey, longestVal, 0, 0)
+			} else {
+				block, err = emitFSTreeInternalExplicit(entries, int(bs), ref.oid, rootXID, node.level, false, 0, 0, 0, 0)
+			}
+			if err != nil {
+				return fmt.Errorf("apfs: splitLeaf: emit internal at level %d: %w", node.level, err)
+			}
+			if _, err := v.c.w.WriteAt(block, int64(ref.paddr*bs)); err != nil {
+				return fmt.Errorf("apfs: splitLeaf: write internal at level %d: %w", node.level, err)
+			}
+			if isRoot {
+				if err := v.reloadRoot(rootPaddr); err != nil {
+					return fmt.Errorf("apfs: splitLeaf: reload root: %w", err)
+				}
+				// Final accurate refresh once the tree shape settles.
+				return v.refreshRoot(rootPaddr)
+			}
+			// Non-root parent fit — propagation stops here, but the
+			// root still needs its tree-wide counts/longest-keys updated
+			// because we added a key. refreshRoot handles that by
+			// walking every child's leftmost descendant.
+			return v.refreshRoot(rootPaddr)
+		}
+		// Parent overflowed: split this internal node by index midpoint.
+		// (entries are now sorted, so the index midpoint is the value
+		// midpoint of the sort order.)
+		if isRoot {
+			return v.promoteRoot(entries, rootPaddr, rootXID, node.level)
+		}
+		mid := len(entries) / 2
+		leftHalf := entries[:mid]
+		rightHalf := entries[mid:]
+		if !leafFitsCheck(leftHalf, int(bs), false) || !leafFitsCheck(rightHalf, int(bs), false) {
+			return fmt.Errorf("apfs: splitLeaf: internal split halves overflow (left=%d, right=%d)", len(leftHalf), len(rightHalf))
+		}
+		// Rewrite this internal node's paddr with the LEFT half.
+		leftBlock, err := emitFSTreeInternalExplicit(leftHalf, int(bs), ref.oid, rootXID, node.level, false, 0, 0, 0, 0)
+		if err != nil {
+			return fmt.Errorf("apfs: splitLeaf: emit internal left at level %d: %w", node.level, err)
+		}
+		if _, err := v.c.w.WriteAt(leftBlock, int64(ref.paddr*bs)); err != nil {
+			return fmt.Errorf("apfs: splitLeaf: write internal left at level %d: %w", node.level, err)
+		}
+		// Allocate a fresh oid+paddr for the RIGHT half.
+		newRightPaddr, newRightOID, err := v.allocateNewTreeNode()
+		if err != nil {
+			return fmt.Errorf("apfs: splitLeaf: alloc internal right at level %d: %w", node.level, err)
+		}
+		rightBlock, err := emitFSTreeInternalExplicit(rightHalf, int(bs), newRightOID, rootXID, node.level, false, 0, 0, 0, 0)
+		if err != nil {
+			return fmt.Errorf("apfs: splitLeaf: emit internal right at level %d: %w", node.level, err)
+		}
+		if _, err := v.c.w.WriteAt(rightBlock, int64(newRightPaddr*bs)); err != nil {
+			return fmt.Errorf("apfs: splitLeaf: write internal right at level %d: %w", node.level, err)
+		}
+		if err := v.upsertVolumeOMAPEntry(newRightOID, rootXID, newRightPaddr); err != nil {
+			return fmt.Errorf("apfs: splitLeaf: omap internal right at level %d: %w", node.level, err)
+		}
+		// Propagate one level up: the level-up parent's existing index
+		// entry for ref.oid keeps pointing at leftHalf (same paddr+oid,
+		// but its leftmost key may have changed), and a new entry for
+		// newRightOID is inserted carrying rightHalf[0].key.
+		curLeftKey = append([]byte(nil), leftHalf[0].key...)
+		curLeftOID = ref.oid
+		curRightKey = append([]byte(nil), rightHalf[0].key...)
+		curRightOID = newRightOID
 	}
-	longestKey, longestVal := v.computeTreeLongestKV(nil)
-	keyCount, nodeCount, err := v.computeTreeCounts(rootEntries)
-	if err != nil {
-		return fmt.Errorf("apfs: splitLeaf: count tree: %w", err)
-	}
-	rootBlock, err := emitFSTreeInternalExplicit(rootEntries, int(bs), v.apsb.rootTreeOID, rootXID, v.rootNode.level, true, longestKey, longestVal, keyCount, nodeCount)
-	if err != nil {
-		return fmt.Errorf("apfs: splitLeaf: emit root: %w", err)
-	}
-	if _, err := v.c.w.WriteAt(rootBlock, int64(rootPaddr*bs)); err != nil {
-		return fmt.Errorf("apfs: splitLeaf: write root at paddr %d: %w", rootPaddr, err)
-	}
-	if err := v.reloadRoot(rootPaddr); err != nil {
-		return fmt.Errorf("apfs: splitLeaf: reload final root: %w", err)
-	}
-	return nil
+	// Shouldn't reach here: the root case `isRoot` always returns
+	// above. Guard anyway so a logic regression surfaces loudly
+	// rather than silently dropping the cascade.
+	return fmt.Errorf("apfs: splitLeaf: cascade propagated past root without termination")
 }

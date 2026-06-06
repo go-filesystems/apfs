@@ -27,12 +27,15 @@
 //	APFS_STRESS_FILE_MB    int             large-file payload in MiB
 //	                                       (default 32 MiB; cap 4 GiB).
 //	APFS_STRESS_FILES      int             many-files file count
-//	                                       (default 1_000). Reads
-//	                                       currently degrade past
-//	                                       ~1024 files due to an
-//	                                       FS-tree leaf-split issue
-//	                                       in the driver; crank up via
-//	                                       env to drive that path.
+//	                                       (default 1_000). Scales
+//	                                       cleanly to 5000+ files;
+//	                                       earlier soft-fail markers
+//	                                       for FS-tree leaf splits and
+//	                                       multi-level delete cascades
+//	                                       were lifted once the
+//	                                       cross-level index update +
+//	                                       empty-subtree pruning
+//	                                       landed.
 //	APFS_STRESS_FAULTS     int             percent of I/O ops the fault
 //	                                       injector should fail (default
 //	                                       10).
@@ -187,8 +190,10 @@ func containerSizeForFiles(files int, perFileBytes int) int64 {
 // serialisation (Container.mu), and is what the existing
 // TestConcurrentStress_MixedOps already exercises — so it's the right
 // surface for stress-grade concurrency probing. The driver's path
-// resolver memoises results in an un-mutex'd map that's only safe under
-// single-goroutine use; concurrent driver users should serialise externally.
+// resolver is now safe for concurrent use too (per-driver opMu +
+// pathCacheMu serialise reads against rootNode swaps in mutating
+// calls); a dedicated regression test for that exists in
+// driver_concurrency_test.go.
 //
 // Pass criteria: no panics, no SHA mismatches, no errors. Reports
 // ops/second on exit so users can plot regressions across commits.
@@ -604,29 +609,25 @@ func TestStress_ManyFiles(t *testing.T) {
 		checked++
 	}
 	readDur := time.Since(readStart)
-	// Mismatch is a hard fail (data loss). Read errors are surfaced
-	// but tolerated to allow this test to probe scaling regimes where
-	// the driver's FS-tree shows degeneration.
+	// Mismatch is a hard fail (data loss). Read errors are now also a
+	// hard fail: the leaf-split index-propagation bug that previously
+	// dropped entries past ~1024 files was fixed by the cross-level
+	// insertSiblingIntoParent path, so missing reads here indicate a
+	// regression.
 	if mismatches > 0 {
 		t.Fatalf("content mismatch on %d/%d sampled files (first read err: %s)",
 			mismatches, checked+mismatches+readErrs, firstReadErr)
 	}
-	if firstReadErr != "" {
-		t.Logf("ManyFiles: sample-read first error: %s (total readErrs=%d/%d)",
-			firstReadErr, readErrs, checked+readErrs)
+	if readErrs > 0 {
+		t.Fatalf("ManyFiles: %d/%d sample reads failed; first: %s",
+			readErrs, checked+readErrs, firstReadErr)
 	}
 
-	// Delete file-by-file (DeleteDir over thousands of entries is a
-	// known-degenerate case against the current FS-tree leaf
-	// accounting). We report delete errors as a metric rather than a
-	// hard assertion because this category is primarily checking
-	// that:
-	//
-	//   1. Creating + listing + reading 5k+ files DOES work end-to-end,
-	//   2. Bulk delete does not *panic*,
-	//
-	// not that the delete path is itself robust under volume — that's
-	// covered in a separate unit-level fix track.
+	// Delete file-by-file. The refreshRoot "empty node at paddr"
+	// regression that previously soft-failed this loop is fixed by
+	// pruneEmptySubtreeChildren, which strips drained subtrees from
+	// the index before the leftmost-key walk runs. Treat any delete
+	// error as a hard fail so a regression of either bug surfaces.
 	delStart := time.Now()
 	delErrs := 0
 	var firstDelErr string
@@ -640,12 +641,13 @@ func TestStress_ManyFiles(t *testing.T) {
 		}
 	}
 	delDur := time.Since(delStart)
-	if firstDelErr != "" {
-		t.Logf("ManyFiles: delete-path first error: %s", firstDelErr)
+	if delErrs > 0 {
+		t.Fatalf("ManyFiles: %d/%d deletes failed; first: %s",
+			delErrs, n, firstDelErr)
 	}
 
-	t.Logf("ManyFiles: n=%d create=%s list=%s read(%d sampled)=%s delete=%s (delErrs=%d)",
-		n, createDur, listDur, checked, readDur, delDur, delErrs)
+	t.Logf("ManyFiles: n=%d create=%s list=%s read(%d sampled)=%s delete=%s",
+		n, createDur, listDur, checked, readDur, delDur)
 }
 
 // ---------------------------------------------------------------------------

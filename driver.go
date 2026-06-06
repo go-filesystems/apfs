@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/go-filesystems/interface"
 )
@@ -59,8 +60,30 @@ type driver struct {
 	// is pathCacheCap entries; full cache simply clears on next
 	// store (no LRU complexity — disk-image workloads typically
 	// touch a few thousand paths, well under the cap).
+	//
+	// pathCacheMu guards every read and write of pathCache so that
+	// concurrent driver-level callers (e.g. parallel ReadFile +
+	// WriteFile on disjoint paths) don't race the underlying Go map.
+	// The volume layer already serialises mutating operations via
+	// Container.mu, so contention here is bounded to the small,
+	// purely in-memory cache map.
+	pathCacheMu  sync.RWMutex
 	pathCache    map[string]cachedInode
 	pathCacheCap int
+
+	// opMu serialises driver-level compound operations.
+	// The single-call Volume APIs (CreateFile, ReadFile, …) already
+	// take Container.mu, but driver methods do multi-step work in
+	// between — first a `lookupFSTreeFirst` outside the lock to
+	// resolve the path, then a Volume mutator that takes the lock,
+	// then a possible second lookup against `v.rootNode` that the
+	// mutator just rewrote. Without a driver-level mutex two
+	// concurrent driver calls can read `v.rootNode` while a third
+	// is in the middle of `reloadRoot` swapping it out. We hold
+	// opMu for the full duration of each driver method (RLock for
+	// read-only, Lock for mutators) so the cross-call sequence is
+	// atomic from the driver's perspective.
+	opMu sync.RWMutex
 }
 
 // cachedInode is a path-cache entry. Stored under the driver lock
@@ -79,9 +102,9 @@ const pathCacheDefaultCap = 4096
 // mutating method before it returns (regardless of success), since
 // the affected oid layout may have changed.
 func (d *driver) invalidatePathCache() {
-	if d.pathCache != nil {
-		d.pathCache = nil
-	}
+	d.pathCacheMu.Lock()
+	d.pathCache = nil
+	d.pathCacheMu.Unlock()
 }
 
 // resolvePath walks the FS-tree from the volume root and returns the
@@ -132,8 +155,10 @@ func (d *driver)resolvePath(path string) (uint64, Inode, error) {
 }
 
 // pathCacheLookup returns the cached entry for `path` if present.
-// Caller holds the container lock (RLock or Lock).
+// Safe for concurrent use: takes pathCacheMu for reading.
 func (d *driver) pathCacheLookup(path string) (cachedInode, bool) {
+	d.pathCacheMu.RLock()
+	defer d.pathCacheMu.RUnlock()
 	if d.pathCache == nil {
 		return cachedInode{}, false
 	}
@@ -143,8 +168,10 @@ func (d *driver) pathCacheLookup(path string) (cachedInode, bool) {
 
 // pathCacheStore inserts an entry into the cache. Flushes the
 // cache when it would exceed pathCacheCap to keep memory bounded.
-// Caller holds the container lock.
+// Safe for concurrent use: takes pathCacheMu for writing.
 func (d *driver) pathCacheStore(path string, entry cachedInode) {
+	d.pathCacheMu.Lock()
+	defer d.pathCacheMu.Unlock()
 	if d.pathCache == nil {
 		d.pathCache = make(map[string]cachedInode, 64)
 	}
@@ -191,6 +218,8 @@ func (d *driver)ReadFile(path string) ([]byte, error) {
 	if d.mountpoint != "" {
 		return mountModeReadFile(d.mountpoint, path)
 	}
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
 	_, ino, err := d.resolvePath(path)
 	if err != nil {
 		return nil, err
@@ -206,6 +235,15 @@ func (d *driver)ListDir(path string) ([]filesystem.DirEntry, error) {
 	if d.mountpoint != "" {
 		return mountModeListDir(d.mountpoint, path)
 	}
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
+	return d.listDirLocked(path)
+}
+
+// listDirLocked is the lock-already-held implementation of ListDir.
+// Internal callers (recursive DeleteDir) avoid double-locking by
+// invoking this directly.
+func (d *driver) listDirLocked(path string) ([]filesystem.DirEntry, error) {
 	_, ino, err := d.resolvePath(path)
 	if err != nil {
 		return nil, err
@@ -251,6 +289,8 @@ func (d *driver)Stat(path string) (filesystem.Stat, error) {
 	if d.mountpoint != "" {
 		return mountModeStat(d.mountpoint, path)
 	}
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
 	_, ino, err := d.resolvePath(path)
 	if err != nil {
 		return nil, err
@@ -274,6 +314,8 @@ func (d *driver)WriteFile(path string, data []byte, perm os.FileMode) error {
 	if d.c.w == nil {
 		return ErrReadOnly
 	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
 	defer d.invalidatePathCache()
 	parent, name := splitParent(path)
 	if name == "" {
@@ -283,7 +325,7 @@ func (d *driver)WriteFile(path string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		// Auto-create parent directories so the API matches the
 		// previous test-driver conventiod.
-		if mkErr := d.MkDir(parent, 0o755); mkErr != nil {
+		if mkErr := d.mkdirLocked(parent, 0o755); mkErr != nil {
 			return fmt.Errorf("apfs: WriteFile: create parent %q: %w", parent, mkErr)
 		}
 		parentOID, _, err = d.resolvePath(parent)
@@ -312,6 +354,8 @@ func (d *driver)ReadLink(path string) (string, error) {
 	if d.mountpoint != "" {
 		return mountModeReadLink(d.mountpoint, path)
 	}
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
 	_, ino, err := d.resolvePath(path)
 	if err != nil {
 		return "", err
@@ -339,6 +383,16 @@ func (d *driver)MkDir(path string, perm os.FileMode) error {
 	if d.c.w == nil {
 		return ErrReadOnly
 	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	return d.mkdirLocked(path, perm)
+}
+
+// mkdirLocked is the lock-already-held implementation of MkDir, so
+// internal callers (WriteFile auto-creating parents, DeleteDir
+// invoking ListDir recursively after a self-locked DeleteDir, etc.)
+// can re-use the same logic without re-acquiring opMu.
+func (d *driver) mkdirLocked(path string, perm os.FileMode) error {
 	defer d.invalidatePathCache()
 	clean := strings.TrimPrefix(path, "/")
 	if clean == "" {
@@ -381,6 +435,13 @@ func (d *driver)DeleteFile(path string) error {
 	if d.c.w == nil {
 		return ErrReadOnly
 	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	return d.deleteFileLocked(path)
+}
+
+// deleteFileLocked is the lock-already-held implementation of DeleteFile.
+func (d *driver) deleteFileLocked(path string) error {
 	defer d.invalidatePathCache()
 	parent, name := splitParent(path)
 	if name == "" {
@@ -401,39 +462,46 @@ func (d *driver)DeleteDir(path string) error {
 	if d.c.w == nil {
 		return ErrReadOnly
 	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	return d.deleteDirLocked(path)
+}
+
+// deleteDirLocked is the lock-already-held implementation of DeleteDir.
+func (d *driver) deleteDirLocked(path string) error {
 	defer d.invalidatePathCache()
 	clean := strings.TrimPrefix(path, "/")
 	if clean == "" {
 		// Wipe everything under root.
-		entries, err := d.ListDir("/")
+		entries, err := d.listDirLocked("/")
 		if err != nil {
 			return err
 		}
 		for _, e := range entries {
 			if e.FileType() == 4 { // DT_DIR
-				if err := d.DeleteDir("/" + e.Name()); err != nil {
+				if err := d.deleteDirLocked("/" + e.Name()); err != nil {
 					return err
 				}
 			} else {
-				if err := d.DeleteFile("/" + e.Name()); err != nil {
+				if err := d.deleteFileLocked("/" + e.Name()); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	entries, err := d.ListDir(path)
+	entries, err := d.listDirLocked(path)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
 		child := path + "/" + e.Name()
 		if e.FileType() == 4 {
-			if err := d.DeleteDir(child); err != nil {
+			if err := d.deleteDirLocked(child); err != nil {
 				return err
 			}
 		} else {
-			if err := d.DeleteFile(child); err != nil {
+			if err := d.deleteFileLocked(child); err != nil {
 				return err
 			}
 		}
@@ -454,6 +522,8 @@ func (d *driver)Rename(oldPath, newPath string) error {
 	if d.c.w == nil {
 		return ErrReadOnly
 	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
 	defer d.invalidatePathCache()
 	oldParent, oldName := splitParent(oldPath)
 	newParent, newName := splitParent(newPath)
