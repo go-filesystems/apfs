@@ -2582,6 +2582,9 @@ func TestWriteFileInPlace_Success(t *testing.T) {
 // chmods the file to 0o400 so OpenContainerRWAuto fails and the
 // read-only fallback engages.
 func TestDriver_ReadOnlyContainer(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping: root bypasses the 0o400 write restriction this test relies on (e.g. under docker/QEMU CI)")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ro.apfs")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -3618,6 +3621,9 @@ func TestDecmpfsLZVNInline_EdgeCases(t *testing.T) {
 // path: chmod the file to 0o400 so OpenContainerRWAuto fails, forcing
 // OpenContainerAuto to take over.
 func TestOpenContainerAsFilesystem_ReadOnly(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping: root bypasses the 0o400 write restriction this test relies on (e.g. under docker/QEMU CI)")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ro.apfs")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {

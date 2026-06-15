@@ -40,9 +40,14 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test (race + coverage)
+      # Native runners get the FULL suite (heavy multi-level B-tree
+      # builders included) under the race detector + coverage. The
+      # heaviest cases push total runtime past Go's default 10m
+      # `go test` timeout even on native arm64, so raise -timeout to
+      # 30m. This is the authoritative correctness + coverage gate.
+      - name: Test (race + coverage, full suite)
         run: |
-          go test -race -coverprofile=cover.out ./...
+          go test -race -timeout 30m -coverprofile=cover.out ./...
           go tool cover -func=cover.out | tail -1
 
       - name: Upload coverage report
@@ -55,6 +60,18 @@ jobs:
 
   # Emulated runners: cross-compile per-package test binaries on the
   # amd64 host (CGO disabled) and run each under QEMU via docker.
+  #
+  # QEMU user-mode emulation is ~10-50x slower than native, so the
+  # heaviest multi-level B-tree / large-volume builders (which already
+  # push native arm64 past the default 10m `go test` timeout) are
+  # gated behind testing.Short() in the test sources. These jobs run
+  # with `-test.short`, so they genuinely execute + pass the core
+  # suite on every arch — proving the architecture works end-to-end,
+  # including s390x exercising the little-endian APFS on-disk codec
+  # from a big-endian host — while skipping the pathologically slow
+  # cases. `-test.timeout=30m` gives the remaining tests headroom
+  # under emulation. Full-suite correctness + the coverage gate live
+  # on the native jobs above.
   emulated:
     name: ${{ matrix.arch }} (qemu)
     runs-on: ubuntu-latest
@@ -105,7 +122,10 @@ jobs:
           done
           ls -l _testbins
 
-      - name: Run test binaries under QEMU
+      # Run under QEMU with -test.short (skip the heavy builders) and a
+      # generous -test.timeout so emulation latency never trips the
+      # default 10m test-binary timeout.
+      - name: Run test binaries under QEMU (-short)
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -121,6 +141,6 @@ jobs:
               -e QEMU_CPU="${{ matrix.qemu_cpu }}" \
               -v "$PWD:/work" -w /work \
               "${{ matrix.image }}" \
-              "/work/${bin}" -test.v
+              "/work/${bin}" -test.v -test.short -test.timeout=30m
             echo "::endgroup::"
           done

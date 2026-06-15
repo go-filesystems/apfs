@@ -22,6 +22,9 @@ import (
 // supports multi-level. We test up to 1000 dirs (well past the prior
 // 50-files unit test) and verify the FS-tree handles the size.
 func TestRootPromotion_LiftsCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short: creates 2000 dirs to drive multi-level FS-tree + volume-OMAP promotion")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "promote.apfs")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
