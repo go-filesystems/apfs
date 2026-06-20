@@ -18,9 +18,6 @@ import (
 // test would fail at CreateFile time with "node overflow at entry N";
 // PASS confirms the promotion actually runs end-to-end.
 func TestRootPromotion_FilesLevel2(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in -short: creates 1500 files to drive level-1 → level-2 FS-tree promotion")
-	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "files.apfs")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
