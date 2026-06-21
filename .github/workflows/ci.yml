@@ -43,11 +43,14 @@ jobs:
       # Native runners get the FULL suite (heavy multi-level B-tree
       # builders included) under the race detector + coverage. The
       # heaviest cases push total runtime past Go's default 10m
-      # `go test` timeout even on native arm64, so raise -timeout to
-      # 30m. This is the authoritative correctness + coverage gate.
+      # `go test` timeout; under the race detector on the hosted arm64
+      # runner the full suite needs more than 30m (it timed out right at
+      # the 30m wall having already reached ~79% coverage), so raise
+      # -timeout to 60m for comfortable headroom. This is the
+      # authoritative correctness + coverage gate.
       - name: Test (race + coverage, full suite)
         run: |
-          go test -race -timeout 30m -coverprofile=cover.out ./...
+          go test -race -timeout 60m -coverprofile=cover.out ./...
           go tool cover -func=cover.out | tail -1
 
       - name: Upload coverage report
