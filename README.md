@@ -1,4 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-apfs.png" alt="go-filesystems/apfs" width="720"></p>
+
 # APFS
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/apfs.svg)](https://pkg.go.dev/github.com/go-filesystems/apfs)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/apfs/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/apfs/actions/workflows/ci.yml)
 
 Pure-Go reader/writer for **real APFS** — the on-disk format Apple's
 `apfs.kext` mounts. Containers written by this package are byte-mountable
