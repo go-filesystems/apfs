@@ -14,6 +14,7 @@ package filesystem_apfs
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -21,12 +22,19 @@ import (
 )
 
 // Compile-time assertions: driver satisfies the common Filesystem
-// interface and the read-only LabelReader capability (full Labeller
-// would require a transactional SetLabel via the volume superblock,
-// which is out of scope here — see Label() docstring below).
+// interface, the read-only LabelReader capability (full Labeller would
+// require a transactional SetLabel via the volume superblock, which is
+// out of scope here — see Label() docstring below), and the optional
+// write capabilities whose machinery the Volume/Container layer already
+// implements (Symlink/Hardlink/Truncate/Grow/Resize).
 var (
 	_ filesystem.Filesystem  = (*driver)(nil)
 	_ filesystem.LabelReader = (*driver)(nil)
+	_ filesystem.Symlinker   = (*driver)(nil)
+	_ filesystem.HardLinker  = (*driver)(nil)
+	_ filesystem.Truncater   = (*driver)(nil)
+	_ filesystem.Grower      = (*driver)(nil)
+	_ filesystem.Resizer     = (*driver)(nil)
 )
 
 // Label returns the APFS volume name (apfs_volname_t, NUL-trimmed
@@ -111,7 +119,7 @@ func (d *driver) invalidatePathCache() {
 // inode oid for `path`. Returns os.ErrNotExist when any component
 // along the way is missing. Memoised via pathCache; the cache is
 // dropped wholesale by `invalidatePathCache` on every mutation.
-func (d *driver)resolvePath(path string) (uint64, Inode, error) {
+func (d *driver) resolvePath(path string) (uint64, Inode, error) {
 	if cached, ok := d.pathCacheLookup(path); ok {
 		return cached.oid, cached.inode, nil
 	}
@@ -203,7 +211,7 @@ func splitParent(path string) (parent, name string) {
 
 // Close releases the container (and the underlying mountpoint when
 // the FS was opened via hdiutil-mount).
-func (d *driver)Close() error {
+func (d *driver) Close() error {
 	if d.mountpoint != "" {
 		return detachImage(d.dev, d.mountpoint)
 	}
@@ -214,7 +222,7 @@ func (d *driver)Close() error {
 }
 
 // ReadFile reads the entire content of the file at `path`.
-func (d *driver)ReadFile(path string) ([]byte, error) {
+func (d *driver) ReadFile(path string) ([]byte, error) {
 	if d.mountpoint != "" {
 		return mountModeReadFile(d.mountpoint, path)
 	}
@@ -231,7 +239,7 @@ func (d *driver)ReadFile(path string) ([]byte, error) {
 }
 
 // ListDir returns the entries directly under `path`.
-func (d *driver)ListDir(path string) ([]filesystem.DirEntry, error) {
+func (d *driver) ListDir(path string) ([]filesystem.DirEntry, error) {
 	if d.mountpoint != "" {
 		return mountModeListDir(d.mountpoint, path)
 	}
@@ -285,7 +293,7 @@ func (d *driver) listDirLocked(path string) ([]filesystem.DirEntry, error) {
 }
 
 // Stat returns metadata for the path.
-func (d *driver)Stat(path string) (filesystem.Stat, error) {
+func (d *driver) Stat(path string) (filesystem.Stat, error) {
 	if d.mountpoint != "" {
 		return mountModeStat(d.mountpoint, path)
 	}
@@ -307,7 +315,7 @@ func (d *driver)Stat(path string) (filesystem.Stat, error) {
 }
 
 // WriteFile creates or overwrites a file at `path`.
-func (d *driver)WriteFile(path string, data []byte, perm os.FileMode) error {
+func (d *driver) WriteFile(path string, data []byte, perm os.FileMode) error {
 	if d.mountpoint != "" {
 		return mountModeWriteFile(d.mountpoint, path, data, perm)
 	}
@@ -350,7 +358,7 @@ func (d *driver)WriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // ReadLink resolves a symlink at `path`.
-func (d *driver)ReadLink(path string) (string, error) {
+func (d *driver) ReadLink(path string) (string, error) {
 	if d.mountpoint != "" {
 		return mountModeReadLink(d.mountpoint, path)
 	}
@@ -374,9 +382,139 @@ func (d *driver)ReadLink(path string) (string, error) {
 	return "", fmt.Errorf("apfs: %q is not a symlink", path)
 }
 
+// Symlink creates a symbolic link at linkPath whose target is the literal
+// string `target`. The parent of linkPath must exist; linkPath itself must
+// not. Targets are stored verbatim as the com.apple.fs.symlink xattr (Apple's
+// convention), mirroring what ReadLink decodes.
+func (d *driver) Symlink(target, linkPath string) error {
+	if d.mountpoint != "" {
+		return os.Symlink(target, filepath.Join(d.mountpoint, linkPath))
+	}
+	if d.c.w == nil {
+		return ErrReadOnly
+	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	defer d.invalidatePathCache()
+	parent, name := splitParent(linkPath)
+	if name == "" {
+		return fmt.Errorf("apfs: Symlink: empty link name")
+	}
+	parentOID, _, err := d.resolvePath(parent)
+	if err != nil {
+		return fmt.Errorf("apfs: Symlink: parent %q: %w", parent, err)
+	}
+	if _, _, e := d.v.lookupFSTreeFirst(encodeDrecKey(parentOID, name)); e == nil {
+		return fmt.Errorf("apfs: Symlink: %q already exists", linkPath)
+	}
+	_, err = d.v.CreateSymlink(parentOID, name, target)
+	return err
+}
+
+// Link adds a hardlink at newPath pointing at the same inode as oldPath. The
+// source must not be a directory and newPath must not already exist.
+func (d *driver) Link(oldPath, newPath string) error {
+	if d.mountpoint != "" {
+		return os.Link(filepath.Join(d.mountpoint, oldPath), filepath.Join(d.mountpoint, newPath))
+	}
+	if d.c.w == nil {
+		return ErrReadOnly
+	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	defer d.invalidatePathCache()
+	srcOID, srcIno, err := d.resolvePath(oldPath)
+	if err != nil {
+		return fmt.Errorf("apfs: Link: source %q: %w", oldPath, err)
+	}
+	if srcIno.IsDir {
+		return fmt.Errorf("apfs: Link: %q is a directory", oldPath)
+	}
+	parent, name := splitParent(newPath)
+	if name == "" {
+		return fmt.Errorf("apfs: Link: empty target name")
+	}
+	parentOID, _, err := d.resolvePath(parent)
+	if err != nil {
+		return fmt.Errorf("apfs: Link: parent %q: %w", parent, err)
+	}
+	if _, _, e := d.v.lookupFSTreeFirst(encodeDrecKey(parentOID, name)); e == nil {
+		return fmt.Errorf("apfs: Link: %q already exists", newPath)
+	}
+	return d.v.CreateHardlink(srcOID, parentOID, name)
+}
+
+// Truncate resizes the regular file at path to newSize bytes (growing with
+// implicit zero-fill, shrinking by dropping trailing data).
+func (d *driver) Truncate(path string, newSize int64) error {
+	if d.mountpoint != "" {
+		return os.Truncate(filepath.Join(d.mountpoint, path), newSize)
+	}
+	if d.c.w == nil {
+		return ErrReadOnly
+	}
+	if newSize < 0 {
+		return fmt.Errorf("apfs: Truncate: negative size %d", newSize)
+	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	defer d.invalidatePathCache()
+	oid, ino, err := d.resolvePath(path)
+	if err != nil {
+		return err
+	}
+	if ino.IsDir {
+		return fmt.Errorf("apfs: Truncate: %q is a directory", path)
+	}
+	if uint64(newSize) > ino.Size {
+		// Grow: the engine's TruncateFile only bumps the logical size, which
+		// would re-expose stale bytes left in an allocated block by a prior
+		// shrink. POSIX truncate must zero-fill the new region, so rewrite the
+		// content zero-padded to newSize instead. (Shrink/equal stays on the
+		// efficient extent-trimming path below.)
+		data, rerr := d.v.ReadFile(ino)
+		if rerr != nil {
+			return rerr
+		}
+		buf := make([]byte, newSize)
+		copy(buf, data)
+		return d.v.OverwriteFile(oid, buf)
+	}
+	return d.v.TruncateFile(oid, uint64(newSize))
+}
+
+// GrowTo expands the underlying container image to newSizeBytes.
+func (d *driver) GrowTo(newSizeBytes int64) error {
+	if d.mountpoint != "" {
+		return fmt.Errorf("apfs: GrowTo: not supported in mount-backed mode")
+	}
+	if d.c.w == nil {
+		return ErrReadOnly
+	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	defer d.invalidatePathCache()
+	return d.c.Grow(newSizeBytes)
+}
+
+// Resize changes the container image size in either direction; shrink is
+// honoured only when the live data fits the smaller size.
+func (d *driver) Resize(newSize int64) error {
+	if d.mountpoint != "" {
+		return fmt.Errorf("apfs: Resize: not supported in mount-backed mode")
+	}
+	if d.c.w == nil {
+		return ErrReadOnly
+	}
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	defer d.invalidatePathCache()
+	return d.c.Resize(newSize)
+}
+
 // MkDir creates a directory at `path`. Idempotent (returns nil if
 // it already exists as a directory).
-func (d *driver)MkDir(path string, perm os.FileMode) error {
+func (d *driver) MkDir(path string, perm os.FileMode) error {
 	if d.mountpoint != "" {
 		return mountModeMkDir(d.mountpoint, path, perm)
 	}
@@ -428,7 +566,7 @@ func (d *driver) mkdirLocked(path string, perm os.FileMode) error {
 }
 
 // DeleteFile removes the file at `path`.
-func (d *driver)DeleteFile(path string) error {
+func (d *driver) DeleteFile(path string) error {
 	if d.mountpoint != "" {
 		return mountModeDeleteFile(d.mountpoint, path)
 	}
@@ -455,7 +593,7 @@ func (d *driver) deleteFileLocked(path string) error {
 }
 
 // DeleteDir recursively removes a directory and its contents.
-func (d *driver)DeleteDir(path string) error {
+func (d *driver) DeleteDir(path string) error {
 	if d.mountpoint != "" {
 		return mountModeDeleteDir(d.mountpoint, path)
 	}
@@ -515,7 +653,7 @@ func (d *driver) deleteDirLocked(path string) error {
 }
 
 // Rename moves the entry at `oldPath` to `newPath`.
-func (d *driver)Rename(oldPath, newPath string) error {
+func (d *driver) Rename(oldPath, newPath string) error {
 	if d.mountpoint != "" {
 		return mountModeRename(d.mountpoint, oldPath, newPath)
 	}
