@@ -2594,6 +2594,16 @@ func TestDriver_ReadOnlyContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chmod(path, 0o600) //nolint:errcheck
+	// The read-only fallback is reached by making OpenContainerRWAuto's
+	// O_RDWR open fail on the 0o400 file. root ignores file permission
+	// bits, so this trick cannot make the container read-only when the
+	// test runs as root (e.g. the QEMU jobs, which run inside docker as
+	// uid 0). In that case Open() returns a writable driver and the
+	// ErrReadOnly assertions below are unsatisfiable, so skip them. The
+	// native jobs run as a non-root user and exercise this path fully.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: 0o400 cannot force read-only open")
+	}
 	fs, err := Open(path, 0)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -3631,6 +3641,13 @@ func TestOpenContainerAsFilesystem_ReadOnly(t *testing.T) {
 	}
 	defer os.Chmod(path, 0o600) //nolint:errcheck
 
+	// root ignores the 0o400 bit, so the read-only fallback never
+	// engages; the WriteFile assertion below is unsatisfiable. Skip
+	// under root (QEMU jobs run as uid 0 in docker); native non-root
+	// jobs cover this path.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: 0o400 cannot force read-only open")
+	}
 	fs, err := Open(path, 0)
 	if err != nil {
 		t.Fatalf("Open RO: %v", err)

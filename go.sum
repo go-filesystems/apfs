@@ -1,3 +1,9 @@
+github.com/go-compressions/lzfse v0.1.0 h1:Hldd2H46hCxJcIPZuCk6QGQGCBj16wYkPLhOarJFhSA=
+github.com/go-compressions/lzfse v0.1.0/go.mod h1:geg9IRFbMNHPgbm8xNwF3AnYTsldTX9YptJ0DOWzYv8=
+github.com/go-fde/apfs v0.0.0-20260620062418-22bb63627e03 h1:0UeLGvNQ5mg5Fk7giogMXfpPIhYWwJlv9/QHvS+3GIw=
+github.com/go-fde/apfs v0.0.0-20260620062418-22bb63627e03/go.mod h1:ycc6b+/P+DirXMx8wIVvRnR/c9lLUo5RRQ+UkF+YGj8=
+github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733 h1:5xJfruoDwUFNWYuGF2vLqmDwY83JHleaRCeqB8daW7A=
+github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733/go.mod h1:9WZHAmuKzDWHFtncQuJ3rJYWnAcgX3VsupSqYITgftE=
 golang.org/x/crypto v0.50.0 h1:zO47/JPrL6vsNkINmLoo/PH1gcxpls50DNogFvB5ZGI=
 golang.org/x/crypto v0.50.0/go.mod h1:3muZ7vA7PBCE6xgPX7nkzzjiUq87kRItoJQM1Yo8S+Q=
 golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
