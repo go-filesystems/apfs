@@ -29,6 +29,8 @@ package filesystem_apfs
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/go-volumes/safeio"
 )
 
 // omapInternalRootCap is the maximum number of index entries that fit
@@ -1617,7 +1619,12 @@ func (v *Volume) isSubtreeEmpty(paddr uint64) (bool, error) {
 // keyAt(0); for an internal node it's the leftmost child's leftmost
 // key (recursive descent down the leftmost path).
 func (v *Volume) leftmostKeyInSubtree(paddr uint64) ([]byte, error) {
+	// Bound the descent so a cyclic/corrupt tree cannot loop forever. (H1.)
+	guard := safeio.NewLoopGuard(maxBTreeDepth)
 	for {
+		if err := guard.Next(); err != nil {
+			return nil, fmt.Errorf("apfs: leftmost descent: %w", err)
+		}
 		raw, err := v.c.readBlock(paddr)
 		if err != nil {
 			return nil, err
@@ -1825,7 +1832,12 @@ func (v *Volume) descendToLeafPath(targetKey []byte) (leafPaddr, leafOID uint64,
 	curInfo := v.rootInfo
 	curPaddr := rootPaddr
 	curOID := v.apsb.rootTreeOID
+	// Bound the descent so a cyclic/corrupt tree cannot loop forever. (H1.)
+	guard := safeio.NewLoopGuard(maxBTreeDepth)
 	for !curNode.IsLeaf() {
+		if err := guard.Next(); err != nil {
+			return 0, 0, nil, fmt.Errorf("apfs: descend: %w", err)
+		}
 		r, err := newNodeReader(curNode, curInfo)
 		if err != nil {
 			return 0, 0, nil, err
@@ -1889,7 +1901,12 @@ func (v *Volume) descendToLeafForKey(targetKey []byte) (leafPaddr, leafOID uint6
 	curNode := v.rootNode
 	curInfo := v.rootInfo
 	var parentInfo childInfo
+	// Bound the descent so a cyclic/corrupt tree cannot loop forever. (H1.)
+	guard := safeio.NewLoopGuard(maxBTreeDepth)
 	for !curNode.IsLeaf() {
+		if err := guard.Next(); err != nil {
+			return 0, 0, childInfo{}, fmt.Errorf("apfs: descend: %w", err)
+		}
 		r, err := newNodeReader(curNode, curInfo)
 		if err != nil {
 			return 0, 0, childInfo{}, err

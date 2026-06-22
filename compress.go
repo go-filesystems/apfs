@@ -41,15 +41,55 @@ import (
 	"io"
 
 	"github.com/go-compressions/lzfse"
+	"github.com/go-volumes/safeio"
 )
+
+// maxDecmpfsSize caps the decompressed size of a transparently-compressed
+// file. The decmpfs header's uncompressedSize is an attacker-controlled
+// uint64 that drives buffer pre-allocation and decoder output; a value such
+// as 2^60 would OOM the host. Real transparently-compressed files are well
+// under this 1 GiB ceiling. Anything larger is rejected as a decompression
+// bomb. (Finding C2.)
+const maxDecmpfsSize = 1 << 30
+
+// checkDecmpfsSize rejects an uncompressedSize that exceeds maxDecmpfsSize so
+// no decoder pre-allocates or decompresses past the cap. Returns the value as
+// an int64 ceiling for safeio helpers.
+func checkDecmpfsSize(uncompressedSize uint64) (int64, error) {
+	if uncompressedSize > maxDecmpfsSize {
+		return 0, fmt.Errorf("apfs: decmpfs: uncompressed size %d exceeds cap %d: %w",
+			uncompressedSize, maxDecmpfsSize, safeio.ErrTooLarge)
+	}
+	return int64(uncompressedSize), nil
+}
+
+// limitedDecompress reads the whole of zr but errors if the decoder produces
+// more than hardCap bytes, defeating a zip-bomb whose declared
+// uncompressedSize is small but whose stream expands without bound. hardCap
+// is the absolute safety ceiling (e.g. maxDecmpfsSize or a per-chunk
+// maximum), NOT the file's declared size: a legitimate stream may inflate to
+// slightly more than its declared size and is later truncated by the caller.
+// The +1 lets us detect "more than the cap" rather than silently truncating.
+func limitedDecompress(zr io.Reader, hardCap int64) ([]byte, error) {
+	lr := io.LimitReader(zr, hardCap+1)
+	out, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(out)) > hardCap {
+		return nil, fmt.Errorf("apfs: decmpfs: decompressed stream exceeds cap %d: %w",
+			hardCap, safeio.ErrTooLarge)
+	}
+	return out, nil
+}
 
 // magic identifiers for the lzfse block stream wrapper. We construct one
 // for the LZVN inline case so we can route the raw payload through the
 // shared lzfse.Decompress entry point without exporting new helpers from
 // the lzfse package.
 const (
-	lzfseMagicLZVNBlock      uint32 = 0x6e787662 // "bvxn"
-	lzfseMagicEndOfStreamLE  uint32 = 0x24787662 // "bvx$"
+	lzfseMagicLZVNBlock     uint32 = 0x6e787662 // "bvxn"
+	lzfseMagicEndOfStreamLE uint32 = 0x24787662 // "bvx$"
 )
 
 // decmpfsXAttrName is the well-known xattr name carrying the decmpfs header
@@ -110,6 +150,11 @@ func decompressDecmpfsInline(xattrPayload []byte) ([]byte, error) {
 func decompressDecmpfs(xattrPayload, rsrcFork []byte) ([]byte, error) {
 	h, err := readDecmpfsHeader(xattrPayload)
 	if err != nil {
+		return nil, err
+	}
+	// Reject a decompression-bomb size before any decoder pre-allocates or
+	// runs. (C2.)
+	if _, err := checkDecmpfsSize(h.uncompressedSize); err != nil {
 		return nil, err
 	}
 	body := xattrPayload[16:]
@@ -175,12 +220,17 @@ func decmpfsZlibInline(body []byte, expectedSize uint64) ([]byte, error) {
 		}
 		return append([]byte(nil), raw...), nil
 	}
+	if _, err := checkDecmpfsSize(expectedSize); err != nil {
+		return nil, err
+	}
 	zr, err := zlib.NewReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("apfs: decmpfs: zlib reader: %w", err)
 	}
 	defer zr.Close()
-	out, err := io.ReadAll(zr)
+	// Bound the inflate at the absolute decmpfs ceiling so a bomb can't OOM;
+	// a legitimate over-inflate is truncated to expectedSize below.
+	out, err := limitedDecompress(zr, maxDecmpfsSize)
 	if err != nil {
 		return nil, fmt.Errorf("apfs: decmpfs: zlib decode: %w", err)
 	}
@@ -293,6 +343,9 @@ const rsrcMaxChunkSize = 0x10000
 // compression header). This is the convention followed by Apple's xnu
 // decmpfs and by afsctool.
 func decmpfsResourceFork(rsrc []byte, cmpType uint32, expectedSize uint64) ([]byte, error) {
+	if _, err := checkDecmpfsSize(expectedSize); err != nil {
+		return nil, err
+	}
 	if len(rsrc) < hfsRsrcHeaderSize+20 {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc: payload too short (%d)", len(rsrc))
 	}
@@ -358,6 +411,9 @@ func decmpfsResourceFork(rsrc []byte, cmpType uint32, expectedSize uint64) ([]by
 //
 // Both types honour the per-chunk Apple "raw passthrough" 0xFF prefix.
 func decmpfsResourceForkOffsetTable(rsrc []byte, cmpType uint32, expectedSize uint64) ([]byte, error) {
+	if _, err := checkDecmpfsSize(expectedSize); err != nil {
+		return nil, err
+	}
 	if len(rsrc) < hfsRsrcHeaderSize+4 {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): payload too short (%d)", len(rsrc))
 	}
@@ -479,7 +535,10 @@ func decmpfsDecodeRsrcChunk(chunk []byte, cmpType uint32) ([]byte, error) {
 			return nil, fmt.Errorf("zlib reader: %w", err)
 		}
 		defer zr.Close()
-		buf, err := io.ReadAll(zr)
+		// A single decmpfs chunk decompresses to at most rsrcMaxChunkSize
+		// (0x10000) bytes; bound the decode so a malicious chunk can't
+		// expand without limit. (C2.)
+		buf, err := limitedDecompress(zr, rsrcMaxChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("zlib decode: %w", err)
 		}
@@ -505,8 +564,10 @@ func findDecmpfsXAttr(xs []XAttr) []byte {
 // compression). For uncompressed files it falls back to ReadFile.
 //
 // Supported decmpfs types:
-//   inline  — 1 (uncompressed), 3 (zlib), 7 (LZVN), 11 (LZFSE)
-//   rsrc-fork — 4 (zlib), 5 (raw), 8 (LZVN), 12 (LZFSE)
+//
+//	inline  — 1 (uncompressed), 3 (zlib), 7 (LZVN), 11 (LZFSE)
+//	rsrc-fork — 4 (zlib), 5 (raw), 8 (LZVN), 12 (LZFSE)
+//
 // Resource-fork variants automatically fetch the file's
 // com.apple.ResourceFork xattr (embedded or stream).
 func (v *Volume) ReadFileTransparent(inode Inode) ([]byte, error) {

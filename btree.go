@@ -9,6 +9,8 @@ package filesystem_apfs
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/go-volumes/safeio"
 )
 
 // B-tree node flags (btn_flags).
@@ -100,6 +102,25 @@ func readBTreeNode(block []byte) (*btreeNode, error) {
 	if dataStart > len(block) {
 		return nil, fmt.Errorf("apfs: btree_node: data start past end of block")
 	}
+	data := block[dataStart:]
+	// Validate the table-of-contents region against the node size BEFORE any
+	// keyAt/valueAt slicing can run. tableSpace is relative to btn_data
+	// (=data); a malicious image can set off/len/nKeys to values that index
+	// out of bounds, so reject anything that does not fit. (Finding C1.)
+	if err := safeio.CheckBounds(int(tableSpace.off), int(tableSpace.len), len(data)); err != nil {
+		return nil, fmt.Errorf("apfs: btree_node: table_space out of range: %w", err)
+	}
+	// Each TOC entry is 4 bytes for fixed-shape trees, 8 for variable-shape.
+	// nKeys entries must fit inside tableSpace.len. nKeys is a uint32; the
+	// multiplication is done in int64 to avoid overflow on 32-bit ints.
+	tocEntrySize := int64(8)
+	if flags&btnFlagFixedKVSize != 0 {
+		tocEntrySize = 4
+	}
+	if int64(nKeys)*tocEntrySize > int64(tableSpace.len) {
+		return nil, fmt.Errorf("apfs: btree_node: nkeys %d * %d exceeds table_space len %d",
+			nKeys, tocEntrySize, tableSpace.len)
+	}
 	return &btreeNode{
 		hdr:        hdr,
 		flags:      flags,
@@ -109,7 +130,7 @@ func readBTreeNode(block []byte) (*btreeNode, error) {
 		freeSpace:  freeSpace,
 		keyFreeLst: keyFreeLst,
 		valFreeLst: valFreeLst,
-		data:       block[dataStart:],
+		data:       data,
 		block:      block,
 	}, nil
 }
@@ -245,25 +266,25 @@ func (r *nodeReader) keyAt(i int) ([]byte, error) {
 	}
 	if r.fixed {
 		entryOff := r.tocBase + i*4
-		toc := readKVOff(r.node.data[entryOff : entryOff+4])
-		start := r.keyBase + int(toc.key)
-		end := start + int(r.keySize)
-		if end > len(r.node.data) {
-			return nil, fmt.Errorf("apfs: keyAt: key past end of node")
+		tocBytes, err := safeio.Slice(r.node.data, entryOff, 4)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: keyAt: toc entry %d: %w", i, err)
 		}
-		return r.node.data[start:end], nil
+		toc := readKVOff(tocBytes)
+		start := r.keyBase + int(toc.key)
+		return safeio.Slice(r.node.data, start, int(r.keySize))
 	}
 	entryOff := r.tocBase + i*8
-	toc := readKVLoc(r.node.data[entryOff : entryOff+8])
+	tocBytes, err := safeio.Slice(r.node.data, entryOff, 8)
+	if err != nil {
+		return nil, fmt.Errorf("apfs: keyAt: toc entry %d: %w", i, err)
+	}
+	toc := readKVLoc(tocBytes)
 	if toc.key.off == nlocOff {
 		return nil, fmt.Errorf("apfs: keyAt: removed entry %d", i)
 	}
 	start := r.keyBase + int(toc.key.off)
-	end := start + int(toc.key.len)
-	if end > len(r.node.data) {
-		return nil, fmt.Errorf("apfs: keyAt: key past end of node")
-	}
-	return r.node.data[start:end], nil
+	return safeio.Slice(r.node.data, start, int(toc.key.len))
 }
 
 // valueAt returns the bytes of the i-th value in the node.
@@ -277,7 +298,11 @@ func (r *nodeReader) valueAt(i int) ([]byte, error) {
 	}
 	if r.fixed {
 		entryOff := r.tocBase + i*4
-		toc := readKVOff(r.node.data[entryOff : entryOff+4])
+		tocBytes, err := safeio.Slice(r.node.data, entryOff, 4)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: valueAt: toc entry %d: %w", i, err)
+		}
+		toc := readKVOff(tocBytes)
 		// Internal-node values are uint64 child OIDs (8 bytes); leaf values
 		// follow the tree-wide valSize.
 		size := r.valSize
@@ -291,14 +316,14 @@ func (r *nodeReader) valueAt(i int) ([]byte, error) {
 		// kvoff.v = val_len for the first value, 2*val_len for the
 		// second, and so on.
 		start := r.valBase - int(toc.val)
-		end := start + int(size)
-		if start < 0 || end > len(r.node.data) {
-			return nil, fmt.Errorf("apfs: valueAt: value out of range")
-		}
-		return r.node.data[start:end], nil
+		return safeio.Slice(r.node.data, start, int(size))
 	}
 	entryOff := r.tocBase + i*8
-	toc := readKVLoc(r.node.data[entryOff : entryOff+8])
+	tocBytes, err := safeio.Slice(r.node.data, entryOff, 8)
+	if err != nil {
+		return nil, fmt.Errorf("apfs: valueAt: toc entry %d: %w", i, err)
+	}
+	toc := readKVLoc(tocBytes)
 	if toc.val.off == nlocOff {
 		return nil, fmt.Errorf("apfs: valueAt: removed entry %d", i)
 	}

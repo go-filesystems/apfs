@@ -17,6 +17,7 @@ package filesystem_apfs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -60,6 +61,15 @@ func FuzzOpen(f *testing.F) {
 		corrupt := append([]byte(nil), seedBytes...)
 		corrupt[32] ^= 0xFF
 		f.Add(corrupt)
+	}
+	// Hardening seeds: poison the NX block size (H2) — 0 and a huge value.
+	if len(seedBytes) >= 40 {
+		zeroBS := append([]byte(nil), seedBytes...)
+		binary.LittleEndian.PutUint32(zeroBS[36:40], 0)
+		f.Add(zeroBS)
+		hugeBS := append([]byte(nil), seedBytes...)
+		binary.LittleEndian.PutUint32(hugeBS[36:40], 0xFFFFFFFF)
+		f.Add(hugeBS)
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {

@@ -97,7 +97,16 @@ func readExtentRefInternalEntries(n *btreeNode, raw []byte) ([]extentRefIndexEnt
 	if err != nil {
 		return nil, err
 	}
-	out := make([]extentRefIndexEntry, 0, int(n.nKeys))
+	// Bound the pre-allocation: n.nKeys is attacker-controlled. The TOC was
+	// validated in readBTreeNode (nKeys*entrySize <= tableSpace.len), but
+	// cap the slice capacity at the number of 8-byte kvloc entries that can
+	// actually fit in the table space so a corrupt nKeys can't drive a huge
+	// allocation. (Finding M1.)
+	capHint := int(n.nKeys)
+	if maxEntries := int(n.tableSpace.len) / 8; capHint > maxEntries {
+		capHint = maxEntries
+	}
+	out := make([]extentRefIndexEntry, 0, capHint)
 	for i := 0; i < int(n.nKeys); i++ {
 		k, kerr := r.keyAt(i)
 		if kerr != nil {

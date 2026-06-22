@@ -119,8 +119,16 @@ func readNXSuperblock(block []byte) (*nxSuperblockNative, error) {
 	if string(block[32:36]) != nxMagicASCII {
 		return nil, fmt.Errorf("apfs: NX SB: magic mismatch")
 	}
+	blockSize := binary.LittleEndian.Uint32(block[36:40])
+	// Validate the container block size BEFORE it drives any allocation
+	// (readBlock makes []byte of this size). APFS uses a power-of-two block
+	// size in [4096, 65536]; reject anything else so a malicious NX SB can't
+	// trigger a ~4 GiB allocation. (Finding H2.)
+	if blockSize < 4096 || blockSize > 65536 || blockSize&(blockSize-1) != 0 {
+		return nil, fmt.Errorf("apfs: NX SB: invalid block size %d (want power-of-two in [4096,65536])", blockSize)
+	}
 	sb := &nxSuperblockNative{
-		blockSize:    binary.LittleEndian.Uint32(block[36:40]),
+		blockSize:    blockSize,
 		blockCount:   binary.LittleEndian.Uint64(block[40:48]),
 		xid:          hdr.xid,
 		nextOID:      binary.LittleEndian.Uint64(block[88:96]),
@@ -161,12 +169,12 @@ func readNXSuperblock(block []byte) (*nxSuperblockNative, error) {
 
 // omapPhys decodes the relevant fields of an omap_phys_t (object type 0x000B).
 type omapPhys struct {
-	flags    uint32
-	snapCnt  uint32
-	treeType uint32
-	snapType uint32
-	treeOID  uint64 // root B-tree of this object map
-	snapOID  uint64
+	flags         uint32
+	snapCnt       uint32
+	treeType      uint32
+	snapType      uint32
+	treeOID       uint64 // root B-tree of this object map
+	snapOID       uint64
 	mostRecentXID uint64
 }
 

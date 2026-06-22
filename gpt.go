@@ -21,17 +21,19 @@ package filesystem_apfs
 // looking at a naked or partitioned image.
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"os"
+
+	"github.com/go-volumes/gpt"
 )
 
 // Apple_APFS partition type GUID is `7C3457EF-0000-11AA-AA11-00306543ECAC`
 // in canonical form. On disk it's stored in mixed-endian "wire" format:
 // the first three groups are little-endian, the rest big-endian.
-//   canonical: 7C3457EF-0000-11AA-AA11-00306543ECAC
-//   wire:      EF 57 34 7C 00 00 AA 11 AA 11 00 30 65 43 EC AC
+//
+//	canonical: 7C3457EF-0000-11AA-AA11-00306543ECAC
+//	wire:      EF 57 34 7C 00 00 AA 11 AA 11 00 30 65 43 EC AC
 var appleAPFSPartTypeGUID = [16]byte{
 	0xEF, 0x57, 0x34, 0x7C,
 	0x00, 0x00,
@@ -46,65 +48,43 @@ var appleAPFSPartTypeGUID = [16]byte{
 const gptSectorSize = 512
 
 // findAPFSPartitionOffset returns the byte offset of the Apple_APFS
-// partition's first sector, or 0 when the image is not GPT-wrapped (i.e.
-// no "EFI PART" magic at sector 1). Returns an error if the image looks
-// GPT-wrapped but contains no Apple_APFS partition.
-func findAPFSPartitionOffset(r containerReader) (int64, error) {
-	// Sector 1 holds the GPT header.
-	hdr := make([]byte, gptSectorSize)
-	if _, err := r.ReadAt(hdr, gptSectorSize); err != nil {
-		if err == io.EOF {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("apfs: gpt: read header at LBA 1: %w", err)
+// partition's first sector, or 0 when the image is not GPT-wrapped (no
+// partition table at all). It delegates to the shared, hardened
+// go-volumes/gpt parser, which validates every offset/length against the
+// device size and never panics on a malicious table.
+//
+// Resolution order, preserving the historical fallback behaviour:
+//   - no partition table (gpt.ErrNoTable) → offset 0 (naked APFS image)
+//   - an Apple_APFS partition exists       → its StartOffset
+//   - a table exists but has no Apple_APFS  → error (don't read garbage)
+//
+// f is the opened image; its size (via Stat) bounds the parser.
+func findAPFSPartitionOffset(f *os.File) (int64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("apfs: gpt: stat image: %w", err)
 	}
-	if string(hdr[0:8]) != "EFI PART" {
-		// Not a GPT-wrapped image. Caller falls back to offset 0.
+	deviceSize := info.Size()
+	if deviceSize <= 0 {
+		// Empty / unstattable image: behave like a naked container.
 		return 0, nil
 	}
-	// Header layout (UEFI 2.x §5.3.2):
-	//   +0x18 uint64 my_lba              — LBA of this header
-	//   +0x48 uint64 partition_entry_lba — LBA where partition entries start
-	//   +0x50 uint32 num_partition_entries
-	//   +0x54 uint32 size_of_partition_entry
-	if len(hdr) < 0x58 {
-		return 0, fmt.Errorf("apfs: gpt: header too short")
+	part, err := gpt.ByType(f, deviceSize, gpt.AppleAPFSGUID)
+	if err == nil {
+		return part.StartOffset, nil
 	}
-	entryLBA := int64(binary.LittleEndian.Uint64(hdr[0x48:0x50]))
-	numEntries := binary.LittleEndian.Uint32(hdr[0x50:0x54])
-	entrySize := binary.LittleEndian.Uint32(hdr[0x54:0x58])
-	if entryLBA == 0 || numEntries == 0 || entrySize < 128 {
-		return 0, fmt.Errorf("apfs: gpt: invalid header (entryLBA=%d, num=%d, size=%d)",
-			entryLBA, numEntries, entrySize)
+	if errors.Is(err, gpt.ErrNoTable) {
+		// Not partitioned at all: naked APFS image at offset 0.
+		return 0, nil
 	}
-	// Read the entry array. Cap at 128 entries (UEFI's standard maximum)
-	// to bound the read; real images use exactly this number.
-	if numEntries > 128 {
-		numEntries = 128
+	if errors.Is(err, gpt.ErrNotFound) {
+		// A partition table exists but carries no Apple_APFS entry. Surface
+		// a clear error rather than reading garbage at offset 0.
+		return 0, fmt.Errorf("apfs: gpt: image is partitioned but has no Apple_APFS partition")
 	}
-	entries := make([]byte, int(numEntries)*int(entrySize))
-	if _, err := r.ReadAt(entries, entryLBA*gptSectorSize); err != nil {
-		return 0, fmt.Errorf("apfs: gpt: read entries at LBA %d: %w", entryLBA, err)
-	}
-	// Each entry:
-	//   +0x00 [16]byte partition_type_guid
-	//   +0x10 [16]byte unique_partition_guid
-	//   +0x20 uint64   starting_lba
-	//   +0x28 uint64   ending_lba
-	for i := uint32(0); i < numEntries; i++ {
-		off := int(i) * int(entrySize)
-		var typeGUID [16]byte
-		copy(typeGUID[:], entries[off:off+16])
-		// Skip unused entries (all-zero type GUID).
-		if typeGUID == [16]byte{} {
-			continue
-		}
-		if typeGUID == appleAPFSPartTypeGUID {
-			startLBA := int64(binary.LittleEndian.Uint64(entries[off+0x20 : off+0x28]))
-			return startLBA * gptSectorSize, nil
-		}
-	}
-	return 0, fmt.Errorf("apfs: gpt: image is GPT-wrapped but has no Apple_APFS partition")
+	// Malformed table (truncated header, bad geometry, …): treated as an
+	// error so we never read past a corrupt table.
+	return 0, fmt.Errorf("apfs: gpt: %w", err)
 }
 
 // offsetReader wraps a containerReader, adding `offset` to every ReadAt

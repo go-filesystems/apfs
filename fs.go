@@ -37,10 +37,54 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"sync"
+
+	"github.com/go-volumes/safeio"
 )
+
+// maxBTreeDepth bounds B-tree descent so a corrupt image whose internal
+// nodes form an unbounded (or cyclic) chain cannot drive infinite recursion
+// into a stack overflow. Real APFS trees are at most a handful of levels
+// deep; 64 is comfortably above any legitimate height while still small
+// enough to terminate quickly. (Finding H1.)
+const maxBTreeDepth = 64
+
+// btreeGuard bounds a single B-tree descent: it caps recursion depth and
+// records every visited child node (by physical block address) so a
+// self-referential or cyclic image terminates with an error instead of
+// recursing forever. One guard is created per top-level traversal. (H1.)
+type btreeGuard struct {
+	depth   int
+	visited *safeio.VisitSet // shared across the whole descent (pointer, not copied)
+}
+
+// newBTreeGuard starts a fresh descent at depth 0 with an empty visited set.
+func newBTreeGuard() *btreeGuard {
+	return &btreeGuard{visited: &safeio.VisitSet{}}
+}
+
+// descend validates a step from parent into a child node located at physical
+// block paddr, then returns a guard for the next level. It enforces three
+// invariants: (1) the depth budget is not exhausted; (2) paddr has not been
+// seen before in this traversal (cycle detection, shared set so cycles across
+// sibling subtrees are caught too); (3) the child sits strictly below the
+// parent in level (a corrupt image that points a node at itself, or at a
+// same/higher level, is rejected).
+func (g *btreeGuard) descend(parent, child *btreeNode, paddr uint64) (*btreeGuard, error) {
+	if g.depth >= maxBTreeDepth {
+		return nil, fmt.Errorf("apfs: btree descent exceeded max depth %d", maxBTreeDepth)
+	}
+	if err := g.visited.Check(paddr); err != nil {
+		return nil, fmt.Errorf("apfs: btree descent: %w", err)
+	}
+	if child.level >= parent.level {
+		return nil, fmt.Errorf("apfs: btree descent: child level %d not below parent level %d", child.level, parent.level)
+	}
+	return &btreeGuard{depth: g.depth + 1, visited: g.visited}, nil
+}
 
 // ErrUnsupported is returned for code paths the parser knows exist on
 // disk but does not yet implement (compressed extents, hashed
@@ -88,11 +132,11 @@ type Container struct {
 	//     mutation after construction may make the reader serve
 	//     stale (but still valid) bytes — this is the documented
 	//     contract.
-	mu        sync.RWMutex
-	r         containerReader
-	w         containerWriter // non-nil when the backend supports writes
-	closer    func() error
-	sb        *nxSuperblockNative
+	mu            sync.RWMutex
+	r             containerReader
+	w             containerWriter // non-nil when the backend supports writes
+	closer        func() error
+	sb            *nxSuperblockNative
 	containerOmap *omapPhys // resolved container object map
 	// allocOIDCursor is a fresh-virtual-oid allocator (seeded lazily from
 	// nx_next_oid; used by leaf-split paths when allocating new FS-tree
@@ -113,27 +157,27 @@ type Container struct {
 // All FS-style descent paths (FS-tree, snapshot meta tree, anything that
 // resolves children through the volume omap) funnel through this helper
 // so hash verification is applied uniformly without per-site copy-paste.
-func (v *Volume) readFSChildBlock(parentReader *nodeReader, idx int) ([]byte, error) {
+func (v *Volume) readFSChildBlock(parentReader *nodeReader, idx int) ([]byte, uint64, error) {
 	childOID, err := parentReader.childOIDAt(idx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	paddr, err := v.c.omapLookup(v.volOmap, childOID, v.xidLimit)
 	if err != nil {
-		return nil, fmt.Errorf("apfs: resolve child %d: %w", childOID, err)
+		return nil, 0, fmt.Errorf("apfs: resolve child %d: %w", childOID, err)
 	}
 	block, err := v.c.readBlock(paddr)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if v.c.verifyHashes {
 		if hash, ok := parentReader.childHashAt(idx); ok {
 			if err := verifyBlockHash(block, hash); err != nil {
-				return nil, fmt.Errorf("apfs: child oid %d: %w", childOID, err)
+				return nil, 0, fmt.Errorf("apfs: child oid %d: %w", childOID, err)
 			}
 		}
 	}
-	return block, nil
+	return block, paddr, nil
 }
 
 // SetVerifyHashes toggles SHA-256 verification of hashed B-tree children.
@@ -202,12 +246,12 @@ type Volume struct {
 // Inode is the minimal projection of a J_INODE_VAL record exposed by
 // this iteration of the parser.
 type Inode struct {
-	ID         uint64 // file system object identifier
-	ParentID   uint64
-	Name       string // populated when discovered through a parent's directory record
-	Mode       uint16 // file mode (POSIX bits)
-	Size       uint64 // logical file size (J_DSTREAM.size)
-	IsDir      bool
+	ID          uint64 // file system object identifier
+	ParentID    uint64
+	Name        string // populated when discovered through a parent's directory record
+	Mode        uint16 // file mode (POSIX bits)
+	Size        uint64 // logical file size (J_DSTREAM.size)
+	IsDir       bool
 	dataExtents []containerExtent // populated for non-empty regular files
 }
 
@@ -331,6 +375,27 @@ func (c *Container) readBlock(bn uint64) ([]byte, error) {
 	return buf, nil
 }
 
+// containerByteSize returns blockCount*blockSize as an int64 ceiling used to
+// cap untrusted allocations (file sizes, extent lengths, sparse-hole gaps).
+// It saturates to math.MaxInt64 on overflow so it stays a safe upper bound
+// rather than wrapping to a small number. A zero/garbage blockCount yields a
+// small positive ceiling (one block) so callers still get a usable bound.
+func (c *Container) containerByteSize() int64 {
+	bs := int64(c.sb.blockSize)
+	if bs <= 0 {
+		bs = 4096
+	}
+	bc := int64(c.sb.blockCount)
+	if bc <= 0 {
+		return bs
+	}
+	// Saturating multiply: if bc*bs overflows int64, clamp to MaxInt64.
+	if bc > math.MaxInt64/bs {
+		return math.MaxInt64
+	}
+	return bc * bs
+}
+
 // omapLookupRoot returns the physical block of an entry in the container or
 // volume omap, given a virtual oid. xidWanted is the maximum acceptable
 // transaction ID — pass ^uint64(0) to mean "the latest".
@@ -355,7 +420,9 @@ func (c *Container) omapLookup(omap *omapPhys, oid, xidWanted uint64) (paddr uin
 	if err != nil {
 		return 0, err
 	}
-	return c.omapLookupInNode(root, info, oid, xidWanted)
+	g := newBTreeGuard()
+	g.visited.Add(omap.treeOID) // the root node we are already standing on
+	return c.omapLookupInNode(root, info, oid, xidWanted, g)
 }
 
 // omapLookupInNode performs a key search within a B-tree node. For the
@@ -367,7 +434,7 @@ func (c *Container) omapLookup(omap *omapPhys, oid, xidWanted uint64) (paddr uin
 // subtree. We find the rightmost entry whose key ≤ (oid, xidWanted) and
 // either descend into the corresponding child (internal node) or return its
 // value (leaf), provided the entry's oid matches the request.
-func (c *Container) omapLookupInNode(n *btreeNode, info *btreeInfo, oid, xidWanted uint64) (uint64, error) {
+func (c *Container) omapLookupInNode(n *btreeNode, info *btreeInfo, oid, xidWanted uint64, g *btreeGuard) (uint64, error) {
 	r, err := newNodeReader(n, info)
 	if err != nil {
 		return 0, err
@@ -461,7 +528,11 @@ func (c *Container) omapLookupInNode(n *btreeNode, info *btreeInfo, oid, xidWant
 	if err != nil {
 		return 0, err
 	}
-	return c.omapLookupInNode(cn, info, oid, xidWanted)
+	cg, err := g.descend(n, cn, childOID)
+	if err != nil {
+		return 0, err
+	}
+	return c.omapLookupInNode(cn, info, oid, xidWanted, cg)
 }
 
 // OpenVolume materialises the volume at the given index of Volumes(). It
@@ -890,6 +961,10 @@ func decodeSnapNameKeyName(k []byte) (string, bool) {
 // (variable kv) under the volume's object map. Used for both the FS-tree
 // proper and the snapshot metadata tree, which share the layout.
 func (v *Volume) traverseBTreeWithOmap(n *btreeNode, info *btreeInfo, visit func(key, val []byte) error) error {
+	return v.traverseBTreeWithOmapGuarded(n, info, visit, newBTreeGuard())
+}
+
+func (v *Volume) traverseBTreeWithOmapGuarded(n *btreeNode, info *btreeInfo, visit func(key, val []byte) error, g *btreeGuard) error {
 	r, err := newNodeReader(n, info)
 	if err != nil {
 		return err
@@ -917,6 +992,7 @@ func (v *Volume) traverseBTreeWithOmap(n *btreeNode, info *btreeInfo, visit func
 	isPhysical := info != nil && info.flags&btreeFlagPhysical != 0
 	for i := 0; i < r.EntryCount(); i++ {
 		var block []byte
+		var paddr uint64
 		if isPhysical {
 			val, verr := r.valueAt(i)
 			if verr != nil {
@@ -925,10 +1001,10 @@ func (v *Volume) traverseBTreeWithOmap(n *btreeNode, info *btreeInfo, visit func
 			if len(val) < 8 {
 				return fmt.Errorf("apfs: physical internal val too short (%d) at idx %d", len(val), i)
 			}
-			childPaddr := binary.LittleEndian.Uint64(val[:8])
-			block, err = v.c.readBlock(childPaddr)
+			paddr = binary.LittleEndian.Uint64(val[:8])
+			block, err = v.c.readBlock(paddr)
 		} else {
-			block, err = v.readFSChildBlock(r, i)
+			block, paddr, err = v.readFSChildBlock(r, i)
 		}
 		if err != nil {
 			return err
@@ -937,7 +1013,11 @@ func (v *Volume) traverseBTreeWithOmap(n *btreeNode, info *btreeInfo, visit func
 		if err != nil {
 			return err
 		}
-		if err := v.traverseBTreeWithOmap(child, info, visit); err != nil {
+		cg, err := g.descend(n, child, paddr)
+		if err != nil {
+			return err
+		}
+		if err := v.traverseBTreeWithOmapGuarded(child, info, visit, cg); err != nil {
 			return err
 		}
 	}
@@ -1000,18 +1080,18 @@ type XAttr struct {
 // Sibling is one J_SIBLING_LINK record: an alternate (parent, name)
 // path for the inode it belongs to (i.e., a hard link).
 type Sibling struct {
-	OwnerID  uint64 // the inode this sibling refers to
+	OwnerID   uint64 // the inode this sibling refers to
 	SiblingID uint64
-	ParentID uint64
-	Name     string
+	ParentID  uint64
+	Name      string
 }
 
 // xattr flags as defined by Apple.
 const (
-	xattrFlagDataStream     uint16 = 0x0001
-	xattrFlagDataEmbedded   uint16 = 0x0002
-	xattrFlagFSOwned        uint16 = 0x0004
-	xattrFlagReserved8      uint16 = 0x0008
+	xattrFlagDataStream   uint16 = 0x0001
+	xattrFlagDataEmbedded uint16 = 0x0002
+	xattrFlagFSOwned      uint16 = 0x0004
+	xattrFlagReserved8    uint16 = 0x0008
 )
 
 // ListXAttrs walks the FS-tree and returns every J_XATTR record attached to
@@ -1075,17 +1155,26 @@ func (v *Volume) ReadXAttrStream(x XAttr) ([]byte, error) {
 	if bs == 0 {
 		bs = 4096
 	}
-	out := make([]byte, 0, x.StreamSize)
+	// Cap every untrusted allocation against the container's byte size. (C3.)
+	maxBytes := v.c.containerByteSize()
+	out := make([]byte, 0)
 	var expected uint64
 	for _, ext := range extents {
 		if ext.logicalOffset > expected {
-			out = append(out, make([]byte, ext.logicalOffset-expected)...)
+			pad, err := safeio.MakeBytes(int64(ext.logicalOffset-expected), maxBytes)
+			if err != nil {
+				return nil, fmt.Errorf("apfs: stream xattr %q sparse hole: %w", x.Name, err)
+			}
+			out = append(out, pad...)
 			expected = ext.logicalOffset
 		}
 		if ext.logicalOffset < expected {
 			return nil, fmt.Errorf("apfs: stream xattr %q has overlapping extents", x.Name)
 		}
-		chunk := make([]byte, ext.length)
+		chunk, err := safeio.MakeBytes(int64(ext.length), maxBytes)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: stream xattr %q extent length: %w", x.Name, err)
+		}
 		if _, err := v.c.r.ReadAt(chunk, int64(ext.physBlock*bs)); err != nil {
 			return nil, err
 		}
@@ -1183,10 +1272,10 @@ func decodeSibling(oid uint64, k, val []byte) (Sibling, bool) {
 		rawName = rawName[:i]
 	}
 	return Sibling{
-		OwnerID:  oid,
+		OwnerID:   oid,
 		SiblingID: siblingID,
-		ParentID: parentID,
-		Name:     string(rawName),
+		ParentID:  parentID,
+		Name:      string(rawName),
 	}, true
 }
 
@@ -1267,10 +1356,10 @@ func compareFSKey(candidate, target []byte) int {
 // the leaf entry whose key compares equal to targetKey. It returns the leaf
 // (key, value) bytes, or os.ErrNotExist when no entry matches.
 func (v *Volume) lookupFSTreeFirst(targetKey []byte) ([]byte, []byte, error) {
-	return v.lookupFSTreeNode(v.rootNode, v.rootInfo, targetKey)
+	return v.lookupFSTreeNode(v.rootNode, v.rootInfo, targetKey, newBTreeGuard())
 }
 
-func (v *Volume) lookupFSTreeNode(n *btreeNode, info *btreeInfo, targetKey []byte) ([]byte, []byte, error) {
+func (v *Volume) lookupFSTreeNode(n *btreeNode, info *btreeInfo, targetKey []byte, g *btreeGuard) ([]byte, []byte, error) {
 	r, err := newNodeReader(n, info)
 	if err != nil {
 		return nil, nil, err
@@ -1317,7 +1406,7 @@ func (v *Volume) lookupFSTreeNode(n *btreeNode, info *btreeInfo, targetKey []byt
 	if idx < 0 {
 		idx = 0
 	}
-	block, err := v.readFSChildBlock(r, idx)
+	block, paddr, err := v.readFSChildBlock(r, idx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1325,7 +1414,11 @@ func (v *Volume) lookupFSTreeNode(n *btreeNode, info *btreeInfo, targetKey []byt
 	if err != nil {
 		return nil, nil, err
 	}
-	return v.lookupFSTreeNode(child, info, targetKey)
+	cg, err := g.descend(n, child, paddr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return v.lookupFSTreeNode(child, info, targetKey, cg)
 }
 
 // errIterStop is the sentinel error used by seekAndIterate to terminate
@@ -1352,7 +1445,7 @@ func (v *Volume) seekAndIterate(target []byte, visit func(k, val []byte) (stop b
 // internally to query the snapshot metadata tree (which shares the FS-tree
 // shape) without duplicating the descent / iteration logic.
 func (v *Volume) seekAndIterateTree(root *btreeNode, info *btreeInfo, target []byte, visit func(k, val []byte) (stop bool, err error)) error {
-	err := v.seekIterNode(root, info, target, visit)
+	err := v.seekIterNode(root, info, target, visit, newBTreeGuard())
 	if errors.Is(err, errIterStop) {
 		return nil
 	}
@@ -1403,7 +1496,7 @@ func (v *Volume) openSnapMetaTree() (*btreeNode, *btreeInfo, error) {
 // ≤ target, descends with the original target, then continues into every
 // subsequent sibling using a "smallest possible" sentinel so the forward
 // iteration is preserved across subtrees.
-func (v *Volume) seekIterNode(n *btreeNode, info *btreeInfo, target []byte, visit func(k, val []byte) (bool, error)) error {
+func (v *Volume) seekIterNode(n *btreeNode, info *btreeInfo, target []byte, visit func(k, val []byte) (bool, error), g *btreeGuard) error {
 	r, err := newNodeReader(n, info)
 	if err != nil {
 		return err
@@ -1463,20 +1556,20 @@ func (v *Volume) seekIterNode(n *btreeNode, info *btreeInfo, target []byte, visi
 	if startChild < 0 {
 		startChild = 0
 	}
-	if err := v.seekIterChild(r, info, startChild, target, visit); err != nil {
+	if err := v.seekIterChild(n, r, info, startChild, target, visit, g); err != nil {
 		return err
 	}
 	minTarget := make([]byte, 8) // (oid=0, type=0): less than any real key
 	for i := startChild + 1; i < nKeys; i++ {
-		if err := v.seekIterChild(r, info, i, minTarget, visit); err != nil {
+		if err := v.seekIterChild(n, r, info, i, minTarget, visit, g); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (v *Volume) seekIterChild(r *nodeReader, info *btreeInfo, idx int, target []byte, visit func(k, val []byte) (bool, error)) error {
-	block, err := v.readFSChildBlock(r, idx)
+func (v *Volume) seekIterChild(parent *btreeNode, r *nodeReader, info *btreeInfo, idx int, target []byte, visit func(k, val []byte) (bool, error), g *btreeGuard) error {
+	block, paddr, err := v.readFSChildBlock(r, idx)
 	if err != nil {
 		return err
 	}
@@ -1484,7 +1577,11 @@ func (v *Volume) seekIterChild(r *nodeReader, info *btreeInfo, idx int, target [
 	if err != nil {
 		return err
 	}
-	return v.seekIterNode(child, info, target, visit)
+	cg, err := g.descend(parent, child, paddr)
+	if err != nil {
+		return err
+	}
+	return v.seekIterNode(child, info, target, visit, cg)
 }
 
 // LookupInodeRecord locates the J_INODE_VAL for the given oid using B-tree
@@ -1633,10 +1730,10 @@ func (v *Volume) FindInode(oid uint64) (Inode, error) {
 // nodes' child OIDs are virtual and resolved through the volume's object
 // map (volOmap).
 func (v *Volume) traverseFSTree(visit func(key, val []byte) error) error {
-	return v.traverseFSNode(v.rootNode, v.rootInfo, visit)
+	return v.traverseFSNode(v.rootNode, v.rootInfo, visit, newBTreeGuard())
 }
 
-func (v *Volume) traverseFSNode(n *btreeNode, info *btreeInfo, visit func(key, val []byte) error) error {
+func (v *Volume) traverseFSNode(n *btreeNode, info *btreeInfo, visit func(key, val []byte) error, g *btreeGuard) error {
 	r, err := newNodeReader(n, info)
 	if err != nil {
 		return err
@@ -1658,7 +1755,7 @@ func (v *Volume) traverseFSNode(n *btreeNode, info *btreeInfo, visit func(key, v
 		return nil
 	}
 	for i := 0; i < r.EntryCount(); i++ {
-		block, err := v.readFSChildBlock(r, i)
+		block, paddr, err := v.readFSChildBlock(r, i)
 		if err != nil {
 			return err
 		}
@@ -1666,7 +1763,11 @@ func (v *Volume) traverseFSNode(n *btreeNode, info *btreeInfo, visit func(key, v
 		if err != nil {
 			return err
 		}
-		if err := v.traverseFSNode(child, info, visit); err != nil {
+		cg, err := g.descend(n, child, paddr)
+		if err != nil {
+			return err
+		}
+		if err := v.traverseFSNode(child, info, visit, cg); err != nil {
 			return err
 		}
 	}
@@ -1852,27 +1953,38 @@ func (v *Volume) ReadFile(inode Inode) ([]byte, error) {
 	if bs == 0 {
 		bs = 4096
 	}
+	// Cap every untrusted allocation against the container's byte size: an
+	// inode.Size / ext.length / sparse-hole gap larger than the whole image
+	// is malformed, so reject it rather than attempt a huge make(). (C3.)
+	maxBytes := v.c.containerByteSize()
 	if len(inode.dataExtents) == 0 {
 		// Nothing on disk; honour the logical size with zeros.
-		return make([]byte, inode.Size), nil
+		return safeio.MakeBytes(int64(inode.Size), maxBytes)
 	}
 	extents := make([]containerExtent, len(inode.dataExtents))
 	copy(extents, inode.dataExtents)
 	sort.Slice(extents, func(i, j int) bool {
 		return extents[i].logicalOffset < extents[j].logicalOffset
 	})
-	out := make([]byte, 0, inode.Size)
+	out := make([]byte, 0)
 	var expected uint64
 	for _, ext := range extents {
 		if ext.logicalOffset > expected {
 			// Sparse hole: pad with zeros up to the next extent's start.
-			out = append(out, make([]byte, ext.logicalOffset-expected)...)
+			pad, err := safeio.MakeBytes(int64(ext.logicalOffset-expected), maxBytes)
+			if err != nil {
+				return nil, fmt.Errorf("apfs: sparse hole: %w", err)
+			}
+			out = append(out, pad...)
 			expected = ext.logicalOffset
 		}
 		if ext.logicalOffset < expected {
 			return nil, fmt.Errorf("apfs: overlapping extents at logical %d (already at %d)", ext.logicalOffset, expected)
 		}
-		chunk := make([]byte, ext.length)
+		chunk, err := safeio.MakeBytes(int64(ext.length), maxBytes)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: extent length: %w", err)
+		}
 		if _, err := v.c.r.ReadAt(chunk, int64(ext.physBlock*bs)); err != nil {
 			return nil, err
 		}
@@ -1882,7 +1994,11 @@ func (v *Volume) ReadFile(inode Inode) ([]byte, error) {
 	// Trailing zero region (size declared in the inode but not covered by
 	// any extent) — zero-fill or truncate as appropriate.
 	if expected < inode.Size {
-		out = append(out, make([]byte, inode.Size-expected)...)
+		pad, err := safeio.MakeBytes(int64(inode.Size-expected), maxBytes)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: trailing zero region: %w", err)
+		}
+		out = append(out, pad...)
 	}
 	if uint64(len(out)) > inode.Size {
 		out = out[:inode.Size]
