@@ -42,6 +42,7 @@ see F-2).
 `LookupInodeRawValue`, `FindInode`, `ReadFile`, `FileReaderAt`,
 `ReadFileTransparent`) and the mutating paths (`WriteFile`,
 `WriteFileInPlace`, `OverwriteFile`, `TruncateFile`, `CreateFile`,
+`CreateFileCompressed`, `CreateFileCompressedCodec`,
 `CreateDirectory`, `CreateSymlink`, `CreateHardlink`, `CreateSparseFile`,
 `CreateFifo`, `CreateSocket`, `CreateBlockDevice`, `CreateCharDevice`,
 `DeleteFile`, `DeleteDirectory`, `Rename`, `SetXAttr`, `SetXAttrStream`,
@@ -135,6 +136,13 @@ against drift.
   Resource-fork variants automatically fetch the file's
   `com.apple.ResourceFork` xattr (embedded or stream). LZVN/LZFSE
   decoding is delegated to `pkg/go-compressions/lzfse`.
+
+  The resource-fork offset-table decoder (types 8/12) accepts **both**
+  the real Apple layout that `ditto --hfsCompression` / the diskimages
+  framework emit (no 256-byte HFS header; `(N+1)` little-endian uint32
+  offsets from byte 0, `offset[0] == 4*(N+1)`) **and** the legacy
+  0x100-header layout. The Apple layout is validated against a real
+  `ditto` image captured in `testdata/golden_big_rsrc.bin`.
 
 ### Write paths
 
@@ -241,6 +249,25 @@ against drift.
 - `SetXAttr(oid, name, payload)` — embedded xattr (`XATTR_DATA_EMBEDDED`)
   for short payloads; `SetXAttrStream(oid, name, payload)` — stream
   xattr (separate dstream) for large payloads.
+- **Compress-on-write** via `CreateFileCompressed(parentOID, name, data)`
+  (and `CreateFileCompressedCodec(..., codec)`): stores a regular file's
+  content transparently compressed exactly as `AppleFSCompression` /
+  `ditto --hfsCompression` does — the inode carries the `UF_COMPRESSED`
+  bsd flag, `INODE_HAS_UNCOMPRESSED_SIZE` + the logical size in
+  `j_inode_val.uncompressed_size`, and no main data fork; a
+  `com.apple.decmpfs` xattr carries the header (and, inline, the payload).
+  Small files use inline compression (zlib type 3 or LZVN type 7); files
+  larger than one 64 KiB chunk use a chunked LZVN resource fork (type 8)
+  in Apple's byte-0 offset-table layout, stored embedded or as a stream
+  `com.apple.ResourceFork` xattr (whose `xattr_obj_id` is drawn from the
+  `apfs_next_obj_id` space, matching Apple). Only apfs.kext-interoperable
+  formats are emitted (LZVN, not LZFSE bvx2). Chunks that don't shrink
+  fall back to Apple's 0xFF raw passthrough. Verified end-to-end:
+  `fsck_apfs -n` clean (no warnings) + apfs.kext mount + transparent
+  read-back byte-exact + `UF_COMPRESSED` reported by the kernel
+  (`TestCompatNative_KextReadsOurCompressedFiles`). LZVN block interop is
+  itself guarded in `go-compressions/lzfse` against Apple's
+  `libcompression` (`COMPRESSION_LZVN`) in both directions.
 - `CreateSnapshot(name)` — pick the container's current xid, CoW the
   live APSB to a fresh paddr (with `o_oid = paddr`, retyped to
   PHYSICAL), insert J_SNAP_META + J_SNAP_NAME records, materialise
