@@ -322,6 +322,16 @@ func (c *Container) refreshAPSBNextObjID(bs uint64) error {
 					if oid > highest {
 						highest = oid
 					}
+				case jTypeFileExt:
+					// An xattr stream (e.g. a com.apple.ResourceFork holding
+					// a compressed file's chunked payload) is keyed by a fresh
+					// object id drawn from the apfs_next_obj_id pool, just like
+					// an inode. Its only FS-tree footprint is a J_FILE_EXTENT
+					// under that id, so account for it here or fsck rejects an
+					// apfs_next_obj_id lower than an id we handed out.
+					if oid > highest {
+						highest = oid
+					}
 				}
 				if typ != jTypeInode {
 					return nil

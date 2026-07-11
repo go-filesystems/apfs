@@ -25,11 +25,18 @@ package filesystem_apfs
 // also fetch the file's com.apple.ResourceFork xattr — embedded or via
 // the xattr stream. The full chain runs in ReadFileTransparent.
 //
+// Compress-on-write is implemented in compress_write.go
+// (CreateFileCompressed): it produces the com.apple.decmpfs xattr and, for
+// large files, the chunked com.apple.ResourceFork payload at write time.
+// The write path emits only formats that are byte-exact interoperable with
+// apfs.kext — inline zlib (type 3), inline LZVN (type 7) and chunked LZVN
+// resource forks (type 8) — verified end-to-end via `fsck_apfs` + a kext
+// mount read-back (TestCompatNative_KextReadsOurCompressedFiles).
+//
 // Not yet implemented:
-//   - Compress-on-write: there is no WriteFileTransparent path that
-//     produces the decmpfs xattr + (for rsrc types) the
-//     com.apple.ResourceFork payload at write time. All writes today
-//     emit raw J_FILE_EXTENT records.
+//   - LZFSE (bvx2) compress-on-write: the read path decodes types 11/12,
+//     but the bvx2 block format is not reliably round-trippable through
+//     Apple's decoder, so the write path uses LZVN instead.
 //   - Any decmpfs type beyond 12 (Apple has not published one as of
 //     macOS 14; reserve the default-case error for that future).
 
@@ -393,27 +400,88 @@ func decmpfsResourceFork(rsrc []byte, cmpType uint32, expectedSize uint64) ([]by
 }
 
 // decmpfsResourceForkOffsetTable decompresses a type 8 (LZVN rsrc) or type
-// 12 (LZFSE rsrc) resource fork. These types use a different chunk
-// descriptor layout than zlib/raw rsrc:
+// 12 (LZFSE rsrc) resource fork. Two on-disk layouts are seen in the wild
+// and both are accepted here:
 //
-//	+0x000  256-byte HFS resource fork header (data_offset = 0x100)
-//	+0x100  uint32 LE  num_chunks (N)
-//	+0x104  (N+1) * uint32 LE  chunk offsets, relative to position 0x100.
-//	        chunk[i] occupies [offset[i], offset[i+1])
-//	+...    chunk payloads
+//   - Apple's real format, as emitted by `ditto --hfsCompression`,
+//     `AppleFSCompression` and the diskimages framework: NO 256-byte HFS
+//     resource-fork header. The offset table sits at byte 0 as (N+1)
+//     little-endian uint32 offsets measured from byte 0; offset[0] equals
+//     4*(N+1) (the start of the chunk data) and offset[N] equals the total
+//     resource length. This is the layout the macOS kext writes and reads.
+//     Handled by decmpfsResourceForkAppleOffsetTable.
+//
+//   - The legacy 0x100-header layout (256-byte HFS resource-fork header
+//     with data_offset = 0x100, then num_chunks + offset table relative to
+//     0x100). Handled by decmpfsResourceForkOffsetTable0x100.
+//
+// The layout is selected by inspecting the first four bytes: a big-endian
+// 0x100 there is the HFS resource-fork header of the legacy layout;
+// anything else is treated as the Apple byte-0 offset table.
 //
 // For type 8 each chunk is the raw LZVN payload (no bvxn block wrapper);
 // the decoder synthesises a bvxn envelope so it can route the payload
-// through lzfse.Decompress.
-//
-// For type 12 each chunk is a complete LZFSE block stream (bvxn / bvx1 /
-// bvx2 blocks terminated by bvx$); chunks are passed straight through.
-//
-// Both types honour the per-chunk Apple "raw passthrough" 0xFF prefix.
+// through lzfse.Decompress. For type 12 each chunk is a complete LZFSE
+// block stream (bvxn / bvx1 / bvx2 blocks terminated by bvx$); chunks are
+// passed straight through. Both types honour the per-chunk Apple "raw
+// passthrough" 0xFF prefix.
 func decmpfsResourceForkOffsetTable(rsrc []byte, cmpType uint32, expectedSize uint64) ([]byte, error) {
 	if _, err := checkDecmpfsSize(expectedSize); err != nil {
 		return nil, err
 	}
+	if len(rsrc) < 8 {
+		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): payload too short (%d)", len(rsrc))
+	}
+	if binary.BigEndian.Uint32(rsrc[0:4]) != hfsRsrcHeaderSize {
+		return decmpfsResourceForkAppleOffsetTable(rsrc, cmpType, expectedSize)
+	}
+	return decmpfsResourceForkOffsetTable0x100(rsrc, cmpType, expectedSize)
+}
+
+// decmpfsResourceForkAppleOffsetTable decodes the real Apple offset-table
+// layout described above: (N+1) LE uint32 offsets from byte 0, offset[0]
+// == 4*(N+1). This is what `ditto --hfsCompression` produces.
+func decmpfsResourceForkAppleOffsetTable(rsrc []byte, cmpType uint32, expectedSize uint64) ([]byte, error) {
+	first := binary.LittleEndian.Uint32(rsrc[0:4])
+	if first < 8 || first%4 != 0 {
+		return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): bad table start 0x%x", first)
+	}
+	tableEnd := int(first)
+	numBlocks := int(first/4) - 1
+	if numBlocks <= 0 {
+		return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): zero block count")
+	}
+	if tableEnd > len(rsrc) {
+		return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): offset table truncated (need %d bytes, have %d)", tableEnd, len(rsrc))
+	}
+	out := make([]byte, 0, expectedSize)
+	prev := tableEnd
+	for i := 0; i < numBlocks; i++ {
+		offStart := int(binary.LittleEndian.Uint32(rsrc[i*4 : i*4+4]))
+		offEnd := int(binary.LittleEndian.Uint32(rsrc[(i+1)*4 : (i+1)*4+4]))
+		if offStart != prev {
+			return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): block %d start %d != expected %d", i, offStart, prev)
+		}
+		if offEnd < offStart || offEnd > len(rsrc) {
+			return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): block %d range [%d,%d) out of fork length %d", i, offStart, offEnd, len(rsrc))
+		}
+		decoded, err := decmpfsDecodeRsrcOffsetChunk(rsrc[offStart:offEnd], cmpType)
+		if err != nil {
+			return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): block %d: %w", i, err)
+		}
+		out = append(out, decoded...)
+		prev = offEnd
+	}
+	if expectedSize > 0 && uint64(len(out)) > expectedSize {
+		out = out[:expectedSize]
+	}
+	return out, nil
+}
+
+// decmpfsResourceForkOffsetTable0x100 decodes the legacy 0x100-header
+// offset-table layout (256-byte HFS resource-fork header, num_chunks +
+// offset table relative to 0x100).
+func decmpfsResourceForkOffsetTable0x100(rsrc []byte, cmpType uint32, expectedSize uint64) ([]byte, error) {
 	if len(rsrc) < hfsRsrcHeaderSize+4 {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): payload too short (%d)", len(rsrc))
 	}
