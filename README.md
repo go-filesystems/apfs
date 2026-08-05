@@ -34,7 +34,10 @@ see F-2).
 | `FormatAppleDmg(path, sizeBytes, cfg)` | Write an Apple-compatible DMG (no UDIF wrapper). |
 
 `Container` carries `Volumes()`, `OpenVolume(index)`, `OpenSnapshot(snap)`,
-`AddVolume(label)`, `Commit()`, `Close()`, and `SetVerifyHashes(on)`.
+`AddVolume(label)`, `Commit()`, `Close()`, `SetVerifyHashes(on)`, and the
+single-chunk container resize trio `Grow(newSizeBytes)`,
+`Shrink(newSizeBytes)`, `Resize(newSizeBytes)` (the last dispatches to
+Grow or Shrink based on the current size; see "Container resize" below).
 
 `Volume` exposes the read paths (`Name`, `ListInodes`, `ListSnapshots`,
 `LookupSnapshotByName`, `ListXAttrs`, `ReadXAttrStream`,
@@ -46,7 +49,7 @@ see F-2).
 `CreateDirectory`, `CreateSymlink`, `CreateHardlink`, `CreateSparseFile`,
 `CreateFifo`, `CreateSocket`, `CreateBlockDevice`, `CreateCharDevice`,
 `DeleteFile`, `DeleteDirectory`, `Rename`, `SetXAttr`, `SetXAttrStream`,
-`CreateSnapshot`, `SetSuppressSnapshotGuard`).
+`CreateSnapshot`, `DeleteSnapshot`, `SetSuppressSnapshotGuard`).
 
 ### `filesystem.Filesystem` entry points
 
@@ -61,6 +64,12 @@ satisfying `pkg/go-filesystems/interface.Filesystem`. They are what
 | `Format(path, sizeBytes, cfg)` | Create a new real APFS container. `cfg.Encryption = &FDEConfig{Passphrase: …}` produces a FileVault-encrypted container. |
 | `OpenFDE(imagePath, passphrase, partIndex)` | Open a FileVault-encrypted real APFS container directly. |
 | `OpenFromBlockDevice(dev, partIndex)` | Open a `BlockRW` backend (already decrypted, e.g. behind QCOW2). |
+
+The driver additionally satisfies `filesystem.LabelReader` (`Label()`,
+read-only — see below), `filesystem.Symlinker`, `filesystem.HardLinker`,
+`filesystem.Truncater`, `filesystem.Grower` (`GrowTo(newSizeBytes)`), and
+`filesystem.Resizer` (`Resize(newSize)`, the uniform grow-or-shrink entry
+point from `pkg/go-filesystems/interface`).
 
 The implementation type (`driver`) is unexported; callers get
 `filesystem.Filesystem`. The compile-time assertion
@@ -273,6 +282,32 @@ against drift.
   PHYSICAL), insert J_SNAP_META + J_SNAP_NAME records, materialise
   the OMAP snapshot tree (subtype `APFS_OBJECT_TYPE_OMAP_SNAPSHOT`),
   bump `apfs_num_snapshots`.
+- `DeleteSnapshot(name)` removes the named snapshot: frees its frozen
+  APSB block, drops the `J_SNAP_NAME` + `J_SNAP_META` records from the
+  snap-meta tree, decrements `apsb.apfs_num_snapshots`, and — when
+  `name` was the most-recent snapshot — rolls the volume OMAP's
+  `om_most_recent_snap` back to the new maximum xid (or 0 when none
+  remain). Returns `os.ErrNotExist` when no snapshot of that name
+  exists.
+- **Container resize** — `Container.Grow(newSizeBytes)`,
+  `Container.Shrink(newSizeBytes)`, and the dispatching
+  `Container.Resize(newSizeBytes)` reshape a live container within the
+  single-chunk regime (≤ 32768 blocks, 128 MiB at the default 4 KiB
+  block size — Apple's `blocks-per-chunk` constant): both update the NX superblock, the
+  spaceman, and the chunk_info_block, and truncate the backing storage
+  when the backend supports it. Grow requires the new size to be
+  strictly larger; Shrink requires it to be strictly smaller, at or
+  above the format-time metadata floor, and rejects (`ErrShrinkUnsupported`)
+  when any block at or above the new boundary is still allocated.
+  Crossing the single-chunk boundary in either direction returns
+  `ErrResizeUnsupported` (allocating a fresh chunk_info_block /
+  bitmap is out of scope for this iteration). The `filesystem.Filesystem`
+  driver exposes the same capability uniformly via `GrowTo` (
+  `filesystem.Grower`) and `Resize` (`filesystem.Resizer`). Verified by
+  `TestResize_GrowShrinkRoundTrip`, `TestResize_ErrShrinkUnsupported`,
+  `TestResize_RejectsCrossChunk`, `TestStress_ResizeCycle`,
+  `TestStress_ResizeConcurrentReaders`, and — on macOS —
+  `TestGrowShrinkThenFsckApfs` (fsck-clean after a native resize).
 - `Container.AddVolume(label)` extends a freshly-formatted
   single-volume container with additional volumes (up to Apple's
   max of 100). Each new volume gets 6 fresh metadata blocks past the
