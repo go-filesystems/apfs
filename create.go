@@ -33,6 +33,7 @@ package filesystem_apfs
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"time"
 )
@@ -1695,39 +1696,28 @@ func drecNameHash(name string) uint32 {
 	return hash & 0x3FFFFF
 }
 
-// crc32cUpdate processes `buf` through the CRC-32C (Castagnoli) check
-// starting from `crc`. Mirrors mkapfs's `lib/checksum.c::crc32c`.
-//
-// We hand-roll the table here rather than depending on hash/crc32 with
-// crc32.MakeTable(crc32.Castagnoli) just to keep the apfs package
-// dependency footprint minimal — the table is small and the inner loop
-// is trivial.
-func crc32cUpdate(crc uint32, buf []byte) uint32 {
-	for _, b := range buf {
-		crc = crc32cTable[byte(crc)^b] ^ (crc >> 8)
-	}
-	return crc
-}
+// castagnoli is the standard-library CRC-32C (Castagnoli) polynomial table,
+// hardware-accelerated (SSE4.2/ARMv8 CRC) where the platform supports it.
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// crc32cTable is the CRC-32C lookup table as used by mkapfs (and
-// matching Castagnoli's polynomial 0x1EDC6F41 reflected). Generated
-// from the same source as `lib/checksum.c`.
-var crc32cTable = func() [256]uint32 {
-	var t [256]uint32
-	const poly = uint32(0x82F63B78) // CRC-32C reflected
-	for i := uint32(0); i < 256; i++ {
-		c := i
-		for k := 0; k < 8; k++ {
-			if c&1 != 0 {
-				c = (c >> 1) ^ poly
-			} else {
-				c >>= 1
-			}
-		}
-		t[i] = c
-	}
-	return t
-}()
+// crc32cUpdate processes `buf` through the CRC-32C (Castagnoli) check
+// starting from the running register `crc`. Mirrors mkapfs's
+// `lib/checksum.c::crc32c`, which keeps the bare reflected running value:
+// seeded with 0xFFFFFFFF and with NO trailing one-complement (see
+// drecNameHash).
+//
+// Go's hash/crc32 computes the canonical CRC-32C, which applies the
+// leading/trailing one-complement internally
+// (crc32.Update(crc, tab, p) == ^rawLoop(^crc, p)). Inverting on the way
+// in and out therefore recovers the bare reflected primitive mkapfs uses:
+//
+//	crc32cUpdate(crc, buf) == ^crc32.Update(^crc, castagnoli, buf)
+//
+// This identity is bit-exact with the former hand-rolled table+loop and
+// chains correctly across successive calls (the inner inversions cancel).
+func crc32cUpdate(crc uint32, buf []byte) uint32 {
+	return ^crc32.Update(^crc, castagnoli, buf)
+}
 
 // APFS reserved oids used by the FS-tree bootstrap helpers.
 const (
