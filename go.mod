@@ -4,7 +4,7 @@ go 1.26.4
 
 require github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733
 
-require github.com/go-fde/apfs v0.0.0-20260620062418-22bb63627e03
+require github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c
 
 require (
 	github.com/go-compressions/lzfse v0.3.0
@@ -13,4 +13,7 @@ require (
 	golang.org/x/crypto v0.50.0
 )
 
-require golang.org/x/sys v0.43.0 // indirect
+require (
+	github.com/go-encryptions/xts v0.0.0-20260702212620-e9fe59a121e5 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+)
