@@ -2,10 +2,14 @@ github.com/go-compressions/lzfse v0.3.0 h1:slxIjY9HeG2llJSoXTwTnQ+u/iKMbr2WHUwaN
 github.com/go-compressions/lzfse v0.3.0/go.mod h1:geg9IRFbMNHPgbm8xNwF3AnYTsldTX9YptJ0DOWzYv8=
 github.com/go-encryptions/xts v0.0.0-20260702212620-e9fe59a121e5 h1:p0heeHiJ+uMORaAAWbZqmKyYmwdO+52eR3Pk+vtyGq0=
 github.com/go-encryptions/xts v0.0.0-20260702212620-e9fe59a121e5/go.mod h1:fjp9R/AL03OpIra6fx0445YmgZ5LvqhXtK0FbDJPSWc=
+github.com/go-encryptions/xts v0.0.0-20260830124722-be3e6a7bf880 h1:uDM9c3w6jmGnwzoIUvJKjZAnbwNRYMPS7qWbjNn7m8Q=
+github.com/go-encryptions/xts v0.0.0-20260830124722-be3e6a7bf880/go.mod h1:LFCI9BbDBVokgn7lXG8axukRSiH84Fv7WFmquYFZELU=
 github.com/go-fde/apfs v0.0.0-20260620062418-22bb63627e03 h1:0UeLGvNQ5mg5Fk7giogMXfpPIhYWwJlv9/QHvS+3GIw=
 github.com/go-fde/apfs v0.0.0-20260620062418-22bb63627e03/go.mod h1:ycc6b+/P+DirXMx8wIVvRnR/c9lLUo5RRQ+UkF+YGj8=
 github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c h1:1f5Pp47OFAL8JiYVAvxo48SbXJPa47T75MAZ7yZyicI=
 github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c/go.mod h1:JJ43mniEoWru4ChFUDCrRgJybjzyBvhbqLxN3hpz/OE=
+github.com/go-fde/apfs v0.0.0-20260830211528-d320f021ebc0 h1:GzndO633bTYJF0L4UC+8xnIbG4/U59OfYhGAY5WOKqA=
+github.com/go-fde/apfs v0.0.0-20260830211528-d320f021ebc0/go.mod h1:Ot6PoUl0P/JQs8dUsAAauSfveirOqotR+F8IeOUTroM=
 github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733 h1:5xJfruoDwUFNWYuGF2vLqmDwY83JHleaRCeqB8daW7A=
 github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733/go.mod h1:9WZHAmuKzDWHFtncQuJ3rJYWnAcgX3VsupSqYITgftE=
 github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c h1:dpQtmDhaRvMiaQWByqrS2VY9yG75d4sdy6BOxbUZM1s=
@@ -18,5 +22,9 @@ github.com/go-volumes/safeio v0.0.0-20260830080216-c99e29c86f27 h1:EduBaCdy3n6Zu
 github.com/go-volumes/safeio v0.0.0-20260830080216-c99e29c86f27/go.mod h1:QQdGwEUmPSdzD+OPq+ZcKso9ljssqgBXNk0/9z7moho=
 golang.org/x/crypto v0.50.0 h1:zO47/JPrL6vsNkINmLoo/PH1gcxpls50DNogFvB5ZGI=
 golang.org/x/crypto v0.50.0/go.mod h1:3muZ7vA7PBCE6xgPX7nkzzjiUq87kRItoJQM1Yo8S+Q=
+golang.org/x/crypto v0.55.0 h1:+KWHjbgOaAQ66dh/YlkZKHlz9ZUlq61AFirAR9ntP8M=
+golang.org/x/crypto v0.55.0/go.mod h1:uq0V9dE/fzQuJtbnL+2EhWOE63vo164FY8xqEnV9xis=
 golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
 golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
+golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
