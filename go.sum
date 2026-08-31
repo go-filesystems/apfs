@@ -8,6 +8,8 @@ github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c h1:1f5Pp47OFAL8JiYVAvx
 github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c/go.mod h1:JJ43mniEoWru4ChFUDCrRgJybjzyBvhbqLxN3hpz/OE=
 github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733 h1:5xJfruoDwUFNWYuGF2vLqmDwY83JHleaRCeqB8daW7A=
 github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733/go.mod h1:9WZHAmuKzDWHFtncQuJ3rJYWnAcgX3VsupSqYITgftE=
+github.com/go-filesystems/interface v0.3.0 h1:cV4+2mvW1eCPyde+KIDRaGuIPAcr2sDgKrxGuGQr98k=
+github.com/go-filesystems/interface v0.3.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
 github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c h1:dpQtmDhaRvMiaQWByqrS2VY9yG75d4sdy6BOxbUZM1s=
 github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c/go.mod h1:eBAzPkLd8zHkg3WiYGk70M4g6PYY8S5K4JP+kEMs0mw=
 github.com/go-volumes/gpt v0.0.0-20260830080217-f939ebaffdf6 h1:YgolUGkVNKbf1sM6fPh+WwDNhIhiai4XQ11FWHuBJDk=

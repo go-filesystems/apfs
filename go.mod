@@ -2,7 +2,7 @@ module github.com/go-filesystems/apfs
 
 go 1.26.4
 
-require github.com/go-filesystems/interface v0.0.0-20260620062526-43b8c95ba733
+require github.com/go-filesystems/interface v0.3.0
 
 require github.com/go-fde/apfs v0.0.0-20260806070302-251df306364c
 
