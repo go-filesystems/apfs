@@ -9,7 +9,7 @@ require github.com/go-fde/apfs v0.0.0-20260830211528-d320f021ebc0
 require (
 	github.com/go-compressions/lzfse v0.3.0
 	github.com/go-volumes/gpt v0.0.0-20260831115417-b3069a3ac03a
-	github.com/go-volumes/safeio v0.0.0-20260830080216-c99e29c86f27
+	github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4
 	golang.org/x/crypto v0.55.0
 )
 
