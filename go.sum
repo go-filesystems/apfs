@@ -1,9 +1,9 @@
 github.com/go-compressions/lzfse v0.3.0 h1:slxIjY9HeG2llJSoXTwTnQ+u/iKMbr2WHUwaNAl/2yI=
 github.com/go-compressions/lzfse v0.3.0/go.mod h1:geg9IRFbMNHPgbm8xNwF3AnYTsldTX9YptJ0DOWzYv8=
-github.com/go-encryptions/xts v0.0.0-20260830124722-be3e6a7bf880 h1:uDM9c3w6jmGnwzoIUvJKjZAnbwNRYMPS7qWbjNn7m8Q=
-github.com/go-encryptions/xts v0.0.0-20260830124722-be3e6a7bf880/go.mod h1:LFCI9BbDBVokgn7lXG8axukRSiH84Fv7WFmquYFZELU=
-github.com/go-fde/apfs v0.0.0-20260830211528-d320f021ebc0 h1:GzndO633bTYJF0L4UC+8xnIbG4/U59OfYhGAY5WOKqA=
-github.com/go-fde/apfs v0.0.0-20260830211528-d320f021ebc0/go.mod h1:Ot6PoUl0P/JQs8dUsAAauSfveirOqotR+F8IeOUTroM=
+github.com/go-encryptions/xts v0.0.0-20260903192301-101a3e472f94 h1:nH2Msy4l+mq7VLuMDhV8iGlFNX0kMiai4BBNJENQ3UQ=
+github.com/go-encryptions/xts v0.0.0-20260903192301-101a3e472f94/go.mod h1:IMkRCLbIbPslkb7X7+lkDG2xkugRjBJG5iax1jQc2gc=
+github.com/go-fde/apfs v0.0.0-20260904173605-5367402620ca h1:Xt7xMKRnViXxoN+VHcl7v/EWR1RXU30qoN88fssOhHU=
+github.com/go-fde/apfs v0.0.0-20260904173605-5367402620ca/go.mod h1:xCPSWhkl9bSUxl9LVGvW0fuQtyHz9blPwiEOzVlLgwM=
 github.com/go-filesystems/interface v0.3.0 h1:cV4+2mvW1eCPyde+KIDRaGuIPAcr2sDgKrxGuGQr98k=
 github.com/go-filesystems/interface v0.3.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
 github.com/go-volumes/gpt v0.0.0-20260831115417-b3069a3ac03a h1:BOFd3NiCNWGkhr9+vxszNCLEFXfW7R7qPCtwsomYgSI=
