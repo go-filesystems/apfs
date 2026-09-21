@@ -67,6 +67,34 @@ jobs:
   # QEMU user-mode emulation is ~10-50x slower than native, so the
   # heaviest multi-level B-tree / large-volume builders (which already
   # push native arm64 past the default 10m `go test` timeout) are
+  # The mount-mode branch, on the only OS that has one.
+  #
+  # cov_darwin_mount_test.go builds a real APFS DMG with hdiutil, opens it
+  # through the darwin mount-mode path, and exercises every driver method that
+  # dispatches on it. Its own comment calls this "the only way to exercise the
+  # `if fs.isMountMode()` branches" -- and it had never run anywhere, because
+  # nothing in this repository was a Mac.
+  #
+  # hdiutil on an image file needs no privilege.
+  #
+  # A separate job rather than a leg of `native`: darwin-only files change what
+  # the coverage gate is computed over. This job judges; it does not count.
+  darwin:
+    name: darwin (hdiutil mount mode)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Test, with the hdiutil judge required
+        env:
+          # A skip here would look exactly like a pass -- and several skips in
+          # that file are this package failing, not the tool being absent.
+          APFS_REQUIRE_HDIUTIL: "1"
+        run: CGO_ENABLED=0 go test ./...
+
   # gated behind testing.Short() in the test sources. These jobs run
   # with `-test.short`, so they genuinely execute + pass the core
   # suite on every arch — proving the architecture works end-to-end,

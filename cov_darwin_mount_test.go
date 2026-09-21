@@ -4,6 +4,7 @@ package filesystem_apfs
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -16,9 +17,21 @@ import (
 func requireHdiutil(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("hdiutil"); err != nil {
+		if mustJudge() {
+			t.Fatalf("APFS_REQUIRE_HDIUTIL is set but hdiutil is not available: %v", err)
+		}
 		t.Skipf("hdiutil not available: %v", err)
 	}
 }
+
+// mustJudge reports whether this lane promised hdiutil would be there.
+//
+// APFS_REQUIRE_HDIUTIL=1 is set by the darwin lane. It covers more than the
+// missing binary: "FormatAppleDmg unavailable" and "Open failed" are failures
+// of THIS PACKAGE, written as skips. On a lane that has hdiutil they are
+// defects, and a defect must never leave through the door marked "not
+// applicable here".
+func mustJudge() bool { return os.Getenv("APFS_REQUIRE_HDIUTIL") != "" }
 
 // TestApfsFS_MountMode_FullRoundTrip creates a real APFS DMG via
 // hdiutil, opens it (which triggers the darwin mount-mode branch
@@ -36,11 +49,17 @@ func TestApfsFS_MountMode_FullRoundTrip(t *testing.T) {
 	if err := FormatAppleDmg(dmg, 8<<20, cfg); err != nil {
 		// hdiutil can fail for many environment-specific reasons
 		// (sandbox, sip, no console, etc.). Skip rather than fail.
+		if mustJudge() {
+			t.Fatalf("FormatAppleDmg unavailable in this environment: %v", err)
+		}
 		t.Skipf("FormatAppleDmg unavailable in this environment: %v", err)
 	}
 	// Open mounts via hdiutil → returns the driver with mountpoint set.
 	fs, err := Open(dmg, -1)
 	if err != nil {
+		if mustJudge() {
+			t.Fatalf("Open (mount-backed) failed: %v", err)
+		}
 		t.Skipf("Open (mount-backed) failed: %v", err)
 	}
 	defer func() {
@@ -171,10 +190,16 @@ func TestApfsFS_MountMode_OpenAndClose(t *testing.T) {
 	dir := t.TempDir()
 	dmg := filepath.Join(dir, "openclose.dmg")
 	if err := FormatAppleDmg(dmg, 4<<20, FormatConfig{Label: "OC"}); err != nil {
+		if mustJudge() {
+			t.Fatalf("FormatAppleDmg: %v", err)
+		}
 		t.Skipf("FormatAppleDmg: %v", err)
 	}
 	fs, err := Open(dmg, -1)
 	if err != nil {
+		if mustJudge() {
+			t.Fatalf("Open: %v", err)
+		}
 		t.Skipf("Open: %v", err)
 	}
 	if err := fs.Close(); err != nil {
