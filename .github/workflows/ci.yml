@@ -31,7 +31,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: '1.27.1'
           cache: true
 
       - name: Vet
@@ -87,7 +87,7 @@ jobs:
         uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: '1.27.1'
       - name: Test, with the hdiutil judge required
         env:
           # A skip here would look exactly like a pass -- and several skips in
@@ -129,7 +129,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: '1.27.1'
           cache: true
 
       - name: Register QEMU binfmt handlers
