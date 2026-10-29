@@ -62,8 +62,57 @@ satisfying `pkg/go-filesystems/interface.Filesystem`. They are what
 | `Open(imagePath, partIndex)` | Open a real APFS container. On macOS, falls back to `hdiutil attach` if the path isn't a parseable container. |
 | `OpenWithKeys(imagePath, partIndex, keys…)` | Same, trying each key as a FileVault passphrase before falling back. |
 | `Format(path, sizeBytes, cfg)` | Create a new real APFS container. `cfg.Encryption = &FDEConfig{Passphrase: …}` produces a FileVault-encrypted container. |
-| `OpenFDE(imagePath, passphrase, partIndex)` | Open a FileVault-encrypted real APFS container directly. |
-| `OpenFromBlockDevice(dev, partIndex)` | Open a `BlockRW` backend (already decrypted, e.g. behind QCOW2). |
+| `OpenFDE(imagePath, passphrase, partIndex)` | Open a FileVault-encrypted volume, read-only (see [FileVault](#filevault-software-encrypted-volumes)). |
+| `OpenFDELimited(imagePath, passphrase, partIndex, lim)` | Same, with `apfsfde.Limits` bounding the key derivation. |
+| `OpenFDEFromBlockDevice(dev, passphrase, partIndex)` | Open a FileVault-encrypted volume on a `BlockRW` (a memory buffer, a QCOW2 device …), read-only. |
+| `OpenFDEFromBlockDeviceLimited(dev, passphrase, partIndex, lim)` | Same with `Limits`: the entry point for an image from elsewhere (an upload, a dropped file). |
+| `OpenFromBlockDevice(dev, partIndex)` | Open an unencrypted container on a `BlockRW` backend. |
+
+## FileVault (software-encrypted volumes)
+
+On a FileVault container the **container metadata is plaintext**: NX
+superblock, checkpoints, container object map, spaceman, the volume
+superblock and its object map. What the VEK encrypts (Apple File System
+Reference, "Encryption"; apfs-fuse `ApfsVolume::ReadBlocks`,
+`BTree::GetNode`, `ApfsDir::ReadFile`):
+
+- file-system tree nodes whose object-map value has `OMAP_VAL_ENCRYPTED`,
+  AES-XTS with 512-byte data units, tweak `paddr × (blocksize / 512)`;
+- file extents (file data and stream xattrs) with a non-zero `crypto_id`,
+  tweak `crypto_id × (blocksize / 512)` + the data unit within the extent.
+
+`OpenFDE*` unlocks the keybags with
+[go-fde/apfs](https://github.com/go-fde/apfs) `UnlockVolumeKey` (container
+keybag → volume keybag → KEK → VEK), opens the volume the key belongs to
+(`APFS_FS_ONEKEY` volumes only: per-file keys are hardware encryption), and
+decrypts exactly those blocks with a go-fde/apfs `SectorCipher`. All other
+blocks are read raw. Up to v0.3.0, the whole device was decrypted, which
+garbled the plaintext metadata (`NX SB: wrong object type`).
+
+```go
+fs, err := apfs.OpenFDEFromBlockDeviceLimited(dev, passphrase, -1, apfsfde.Limits{
+	MaxPBKDF2Iterations: 1 << 22, MaxArgon2Time: 4, MaxArgon2MemoryKiB: 1 << 18,
+})
+switch {
+case errors.Is(err, apfs.ErrWrongPassphrase): // ask again
+case errors.Is(err, apfs.ErrLimit):           // the keybag asks for too much work
+}
+```
+
+- `partIndex`: a bare container ignores it. On a partitioned image, `-1`
+  picks the first Apple_APFS partition and `n ≥ 0` picks slot `n`.
+- **Read-only.** This package's writers write plaintext nodes and extents
+  with `crypto_id` 0, which would store data in clear on an encrypted
+  volume, so a FileVault volume opened here refuses writes.
+- Untrusted input: block sizes, keybag sizes, block numbers and DER blobs
+  are bounded in go-fde/apfs. Block offsets that do not fit in an int64 are
+  refused here. `FuzzOpenUnlocked` fuzzes the read path behind the XTS
+  layer.
+- Cost on an Apple M4 Max, one core, measured while the machine was loaded
+  (1-minute load average about 10, so treat these as indicative): opening
+  is dominated by the PBKDF2 the keybag asks for (100,000 iterations ≈
+  13.5 ms). After that, listing the root and reading a 300 KiB file takes
+  155 µs encrypted against 43 µs plain, with decryption at about 2 GB/s.
 
 The driver additionally satisfies `filesystem.LabelReader` (`Label()`,
 read-only — see below), `filesystem.Symlinker`, `filesystem.HardLinker`,

@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/go-compressions/lzfse"
-	apfsfde "github.com/go-fde/apfs"
 )
 
 // TestFormat_Plain covers Format with no encryption and the
@@ -2468,40 +2467,6 @@ func TestTruncateFile_PartialExtentShrink(t *testing.T) {
 	}
 	if ino.Size != 4096 {
 		t.Errorf("Size: got %d, want 4096", ino.Size)
-	}
-}
-
-// TestFdeContainerBackend_Passthrough covers WriteAt and Close on the
-// fdeContainerBackend wrapper (apfs_fde.go:82-83). We construct a real
-// *apfsfde.Device via Format, wrap it, and round-trip a byte through
-// WriteAt → ReadAt.
-func TestFdeContainerBackend_Passthrough(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "fde-wrap.bin")
-	if err := os.WriteFile(path, make([]byte, 1<<20), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	dev, err := apfsfde.Format(path, []byte("pass"))
-	if err != nil {
-		t.Fatalf("apfsfde.Format: %v", err)
-	}
-	b := &fdeContainerBackend{dev: dev}
-	// WriteAt + ReadAt round-trip past the encrypted-payload offset.
-	// XTS requires sector-aligned (512-byte) reads/writes.
-	off := int64(4096)
-	want := bytes.Repeat([]byte{0x5A}, 512)
-	if _, err := b.WriteAt(want, off); err != nil {
-		t.Fatalf("WriteAt: %v", err)
-	}
-	got := make([]byte, 512)
-	if _, err := b.ReadAt(got, off); err != nil {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("round-trip mismatch: got %x want %x", got[:16], want[:16])
-	}
-	if err := b.Close(); err != nil {
-		t.Errorf("Close: %v", err)
 	}
 }
 

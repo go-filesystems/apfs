@@ -147,6 +147,11 @@ type Container struct {
 	// stored alongside the child OID in the parent. Disabled by default;
 	// flip with SetVerifyHashes.
 	verifyHashes bool
+	// fsCrypt is set (before any volume is opened) when the container was
+	// opened with a FileVault passphrase: readBlock then decrypts the blocks
+	// the object maps flag OMAP_VAL_ENCRYPTED and file-extent reads decrypt
+	// extents with a crypto_id. Everything else is read raw. See fde_crypt.go.
+	fsCrypt *fsCrypt
 }
 
 // readFSChildBlock resolves a virtual child OID stored in entry idx of
@@ -261,6 +266,7 @@ type containerExtent struct {
 	logicalOffset uint64
 	length        uint64
 	physBlock     uint64
+	cryptoID      uint64 // j_file_extent_val_t.crypto_id: the XTS tweak base on a ONEKEY volume
 }
 
 // OpenContainer opens a real APFS container at path read-only.
@@ -368,9 +374,18 @@ func (c *Container) readBlock(bn uint64) ([]byte, error) {
 	if bs == 0 {
 		bs = 4096
 	}
-	buf := make([]byte, bs)
-	if _, err := c.r.ReadAt(buf, int64(bn)*int64(bs)); err != nil {
+	off, err := blockByteOffset(bn, uint64(bs))
+	if err != nil {
 		return nil, err
+	}
+	buf := make([]byte, bs)
+	if _, err := c.r.ReadAt(buf, off); err != nil {
+		return nil, err
+	}
+	if c.fsCrypt != nil && c.fsCrypt.isEncrypted(bn) {
+		if err := c.fsCrypt.decryptBlocks(buf, bn); err != nil {
+			return nil, err
+		}
 	}
 	return buf, nil
 }
@@ -501,7 +516,11 @@ func (c *Container) omapLookupInNode(n *btreeNode, info *btreeInfo, oid, xidWant
 			return 0, fmt.Errorf("apfs: omap value too short")
 		}
 		// omap_val: uint32 flags, uint32 size, uint64 paddr.
-		return binary.LittleEndian.Uint64(v[8:16]), nil
+		paddr := binary.LittleEndian.Uint64(v[8:16])
+		if c.fsCrypt != nil && binary.LittleEndian.Uint32(v[0:4])&omapValEncrypted != 0 {
+			c.fsCrypt.markEncrypted(paddr)
+		}
+		return paddr, nil
 	}
 	// Internal node: when target precedes all entries (idx<0) we descend
 	// into the leftmost child anyway because an entry with oid≥target may
@@ -1175,7 +1194,7 @@ func (v *Volume) ReadXAttrStream(x XAttr) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("apfs: stream xattr %q extent length: %w", x.Name, err)
 		}
-		if _, err := v.c.r.ReadAt(chunk, int64(ext.physBlock*bs)); err != nil {
+		if err := readExtentAt(v.c.r, v.c.fsCrypt, bs, ext, chunk, 0); err != nil {
 			return nil, err
 		}
 		out = append(out, chunk...)
@@ -1936,6 +1955,7 @@ func decodeFileExtent(k, val []byte) (containerExtent, bool) {
 		logicalOffset: logical,
 		length:        length,
 		physBlock:     phys,
+		cryptoID:      binary.LittleEndian.Uint64(val[16:24]),
 	}, true
 }
 
@@ -1985,7 +2005,7 @@ func (v *Volume) ReadFile(inode Inode) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("apfs: extent length: %w", err)
 		}
-		if _, err := v.c.r.ReadAt(chunk, int64(ext.physBlock*bs)); err != nil {
+		if err := readExtentAt(v.c.r, v.c.fsCrypt, bs, ext, chunk, 0); err != nil {
 			return nil, err
 		}
 		out = append(out, chunk...)

@@ -222,6 +222,7 @@ type apsbSuperblock struct {
 	numSnapshots      uint32 // apfs_num_snapshots (APSB +0xD4)
 	volumeName        string
 	uuid              [16]byte
+	fsFlags           uint64 // apfs_fs_flags (APSB +0x108): APFS_FS_UNENCRYPTED, APFS_FS_ONEKEY, …
 }
 
 // snapMetaIsPhysical reports whether the snap-meta tree is stored
@@ -261,6 +262,7 @@ func readAPSB(block []byte) (*apsbSuperblock, error) {
 		extentRefTreeType: binary.LittleEndian.Uint32(block[0x78:0x7C]),
 		snapMetaTreeType:  binary.LittleEndian.Uint32(block[0x7C:0x80]),
 		numSnapshots:      binary.LittleEndian.Uint32(block[0xD4:0xD8]),
+		fsFlags:           binary.LittleEndian.Uint64(block[0x108:0x110]),
 	}
 	// Volume name lives at offset 0x2C0 (apfs_volname_t, 256 bytes,
 	// NUL-terminated).

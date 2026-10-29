@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/go-compressions/lzfse v0.5.0
-	github.com/go-fde/apfs v0.0.0-20261013201543-56b159ff7a3a
+	github.com/go-fde/apfs v0.2.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-volumes/gpt v0.3.0
 	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b
