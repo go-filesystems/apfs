@@ -30,6 +30,7 @@ type extentReaderAt struct {
 	blockSize uint64
 	extents   []containerExtent // sorted by logicalOffset, no overlaps
 	totalSize uint64
+	crypt     *fsCrypt // non-nil on an unlocked FileVault volume
 }
 
 // ReadAt copies bytes from the logical address `off` into p. Behaves
@@ -77,10 +78,9 @@ func (r *extentReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		}
 		// Map to physical: extent starts at physBlock * blockSize;
 		// the position within the extent is (lo - ext.logicalOffset).
-		physOff := int64(ext.physBlock*r.blockSize) + int64(lo-ext.logicalOffset)
 		dstStart := lo - uint64(off)
 		dstEnd := hi2 - uint64(off)
-		if _, err := r.r.ReadAt(dst[dstStart:dstEnd], physOff); err != nil {
+		if err := readExtentAt(r.r, r.crypt, r.blockSize, ext, dst[dstStart:dstEnd], lo-ext.logicalOffset); err != nil {
 			// Short reads from the underlying device are unexpected
 			// (extents always map to allocated blocks in our writer).
 			return int(dstStart), fmt.Errorf("apfs: extentReaderAt: read at paddr %d: %w",
@@ -131,6 +131,7 @@ func (v *Volume) FileReaderAt(inode Inode) (io.ReaderAt, error) {
 		blockSize: bs,
 		extents:   sorted,
 		totalSize: inode.Size,
+		crypt:     v.c.fsCrypt,
 	}, nil
 }
 
@@ -181,6 +182,7 @@ func (v *Volume) XAttrStreamReaderAt(x XAttr) (io.ReaderAt, error) {
 		blockSize: bs,
 		extents:   extents,
 		totalSize: x.StreamSize,
+		crypt:     v.c.fsCrypt,
 	}, nil
 }
 

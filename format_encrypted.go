@@ -105,11 +105,9 @@ const (
 // container + volume keybag pair the kext-style unlock walk
 // (passphrase → PBKDF2-derived key → KEK → VEK) can recover.
 //
-// The container is byte-compatible with apfsfde.Open at the keybag-chain
-// level — see TestFormatContainerEncrypted_Roundtrips. It is NOT yet
-// expected to mount via `hdiutil attach -stdinpass` because the volume
-// metadata blocks (APSB, OMAPs, FS-tree root, …) are still plaintext;
-// adding the AES-XTS-VEK layer on top is the next iteration.
+// The keybag chain unlocks with go-fde/apfs, and OpenFDE reads the result
+// (TestOpenFDE_FreshFormat). The volume is empty, and its FS-tree nodes are
+// written without OMAP_VAL_ENCRYPTED, so nothing is VEK-encrypted yet.
 func FormatContainerEncrypted(path string, sizeBytes int64, volumeLabel string, passphrase []byte) error {
 	const blockSize = 4096
 	if sizeBytes < int64(formatVolumeKeybagBlock+1)*blockSize {

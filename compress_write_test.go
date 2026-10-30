@@ -111,7 +111,7 @@ func TestCreateFileCompressed_InlinePassthrough(t *testing.T) {
 	// passthrough is used. Random-ish bytes.
 	data := make([]byte, 300)
 	for i := range data {
-		data[i] = byte((i*2654435761 + 1013904223) >> 13)
+		data[i] = byte((uint64(i)*2654435761 + 1013904223) >> 13) // uint64: the constant overflows a 32-bit int
 	}
 	got := roundTripCompressed(t, CompressAuto, data)
 	if !bytes.Equal(got, data) {
