@@ -3,7 +3,7 @@ module github.com/go-filesystems/apfs
 go 1.27.1
 
 require (
-	github.com/go-compressions/lzfse v0.5.0
+	github.com/go-compressions/lzfse v0.6.0
 	github.com/go-fde/apfs v0.3.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-volumes/gpt v0.3.0

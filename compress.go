@@ -44,6 +44,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -88,6 +89,38 @@ func limitedDecompress(zr io.Reader, hardCap int64) ([]byte, error) {
 			hardCap, safeio.ErrTooLarge)
 	}
 	return out, nil
+}
+
+// decmpfsCeiling is the most bytes a decoder may produce for a file whose
+// decmpfs header declares uncompressedSize: the declared size plus one chunk of
+// slack (a stream that inflates slightly past its declared size is truncated by
+// the caller, a stream that inflates to a multiple of it is a bomb). A declared
+// size of zero keeps the global maxDecmpfsSize ceiling. The header's field is
+// itself attacker-controlled, but it is already capped at maxDecmpfsSize by
+// checkDecmpfsSize, and the ceiling is only ever lower than that.
+func decmpfsCeiling(declared uint64) int {
+	if declared == 0 {
+		return maxDecmpfsSize
+	}
+	return int(min(declared+rsrcMaxChunkSize, uint64(maxDecmpfsSize)))
+}
+
+// lzfseDecode is lzfse.DecompressLimit with the ceiling error also matching
+// safeio.ErrTooLarge, the sentinel the rest of this file reports bombs with.
+func lzfseDecode(src []byte, ceiling int) ([]byte, error) {
+	out, err := lzfse.DecompressLimit(src, ceiling)
+	if errors.Is(err, lzfse.ErrTooLarge) {
+		return nil, fmt.Errorf("%w: %w", err, safeio.ErrTooLarge)
+	}
+	return out, err
+}
+
+// decmpfsOutCap is the capacity to reserve for a chunked decode: the declared
+// size, but never more than the chunks can produce (each decodes to at most
+// rsrcMaxChunkSize). A header declaring 1 GiB over a three-chunk fork reserved
+// the whole gigabyte up front.
+func decmpfsOutCap(declared uint64, numBlocks int) int {
+	return int(min(declared, uint64(numBlocks)*rsrcMaxChunkSize))
 }
 
 // magic identifiers for the lzfse block stream wrapper. We construct one
@@ -235,9 +268,11 @@ func decmpfsZlibInline(body []byte, expectedSize uint64) ([]byte, error) {
 		return nil, fmt.Errorf("apfs: decmpfs: zlib reader: %w", err)
 	}
 	defer zr.Close()
-	// Bound the inflate at the absolute decmpfs ceiling so a bomb can't OOM;
-	// a legitimate over-inflate is truncated to expectedSize below.
-	out, err := limitedDecompress(zr, maxDecmpfsSize)
+	// Bound the inflate by the declared size (plus one chunk of slack), not by
+	// the global 1 GiB ceiling: a 10-byte declared size over a stream that
+	// inflates to a gigabyte used to be allowed to. A legitimate small
+	// over-inflate is truncated to expectedSize below.
+	out, err := limitedDecompress(zr, int64(decmpfsCeiling(expectedSize)))
 	if err != nil {
 		return nil, fmt.Errorf("apfs: decmpfs: zlib decode: %w", err)
 	}
@@ -276,7 +311,7 @@ func decmpfsLZVNInline(body []byte, expectedSize uint64) ([]byte, error) {
 	eos := make([]byte, 4)
 	binary.LittleEndian.PutUint32(eos, lzfseMagicEndOfStreamLE)
 	wrapped = append(wrapped, eos...)
-	out, err := lzfse.Decompress(wrapped)
+	out, err := lzfseDecode(wrapped, decmpfsCeiling(expectedSize))
 	if err != nil {
 		return nil, fmt.Errorf("apfs: decmpfs: LZVN decode: %w", err)
 	}
@@ -304,7 +339,7 @@ func decmpfsLZFSEInline(body []byte, expectedSize uint64) ([]byte, error) {
 		}
 		return append([]byte(nil), raw...), nil
 	}
-	out, err := lzfse.Decompress(body)
+	out, err := lzfseDecode(body, decmpfsCeiling(expectedSize))
 	if err != nil {
 		return nil, fmt.Errorf("apfs: decmpfs: LZFSE decode: %w", err)
 	}
@@ -370,14 +405,19 @@ func decmpfsResourceFork(rsrc []byte, cmpType uint32, expectedSize uint64) ([]by
 	if numBlocks <= 0 {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc: zero block count")
 	}
-	if descBase+numBlocks*8 > len(rsrc) {
+	// Divide first: numBlocks is a u32 off the disk, and numBlocks*8 wraps an
+	// int on a 32-bit target before the comparison sees it.
+	if numBlocks > len(rsrc)/8 || descBase+numBlocks*8 > len(rsrc) {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc: descriptor array truncated (need %d blocks)", numBlocks)
 	}
 	// Block descriptor offsets are relative to dataOffset+4 (= start of
 	// the total_size word within the compression header).
 	descRefBase := dataOffset + 4
-	out := make([]byte, 0, expectedSize)
+	out := make([]byte, 0, decmpfsOutCap(expectedSize, numBlocks))
 	for i := 0; i < numBlocks; i++ {
+		if expectedSize > 0 && uint64(len(out)) >= expectedSize {
+			break // the rest would be truncated away below
+		}
 		descOff := descBase + i*8
 		off := int(binary.LittleEndian.Uint32(rsrc[descOff : descOff+4]))
 		length := int(binary.LittleEndian.Uint32(rsrc[descOff+4 : descOff+8]))
@@ -454,9 +494,12 @@ func decmpfsResourceForkAppleOffsetTable(rsrc []byte, cmpType uint32, expectedSi
 	if tableEnd > len(rsrc) {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): offset table truncated (need %d bytes, have %d)", tableEnd, len(rsrc))
 	}
-	out := make([]byte, 0, expectedSize)
+	out := make([]byte, 0, decmpfsOutCap(expectedSize, numBlocks))
 	prev := tableEnd
 	for i := 0; i < numBlocks; i++ {
+		if expectedSize > 0 && uint64(len(out)) >= expectedSize {
+			break // the rest would be truncated away below
+		}
 		offStart := int(binary.LittleEndian.Uint32(rsrc[i*4 : i*4+4]))
 		offEnd := int(binary.LittleEndian.Uint32(rsrc[(i+1)*4 : (i+1)*4+4]))
 		if offStart != prev {
@@ -465,7 +508,7 @@ func decmpfsResourceForkAppleOffsetTable(rsrc []byte, cmpType uint32, expectedSi
 		if offEnd < offStart || offEnd > len(rsrc) {
 			return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): block %d range [%d,%d) out of fork length %d", i, offStart, offEnd, len(rsrc))
 		}
-		decoded, err := decmpfsDecodeRsrcOffsetChunk(rsrc[offStart:offEnd], cmpType)
+		decoded, err := decmpfsDecodeRsrcOffsetChunkSized(rsrc[offStart:offEnd], cmpType, chunkRawBytes(expectedSize, len(out)))
 		if err != nil {
 			return nil, fmt.Errorf("apfs: decmpfs rsrc(apple): block %d: %w", i, err)
 		}
@@ -494,6 +537,9 @@ func decmpfsResourceForkOffsetTable0x100(rsrc []byte, cmpType uint32, expectedSi
 		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): zero block count")
 	}
 	tableStart := dataOffset + 4
+	if numBlocks > len(rsrc)/4 { // divide first: (numBlocks+1)*4 wraps on 32-bit
+		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): offset table truncated (need %d entries)", numBlocks+1)
+	}
 	tableEnd := tableStart + (numBlocks+1)*4
 	if tableEnd > len(rsrc) {
 		return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): offset table truncated (need %d entries)", numBlocks+1)
@@ -503,8 +549,11 @@ func decmpfsResourceForkOffsetTable0x100(rsrc []byte, cmpType uint32, expectedSi
 		chunkPerSize = (expectedSize + uint64(numBlocks) - 1) / uint64(numBlocks)
 		_ = chunkPerSize // kept for future per-chunk size sanity checks
 	}
-	out := make([]byte, 0, expectedSize)
+	out := make([]byte, 0, decmpfsOutCap(expectedSize, numBlocks))
 	for i := 0; i < numBlocks; i++ {
+		if expectedSize > 0 && uint64(len(out)) >= expectedSize {
+			break // the rest would be truncated away below
+		}
 		startEntry := tableStart + i*4
 		endEntry := startEntry + 4
 		offStart := int(binary.LittleEndian.Uint32(rsrc[startEntry:endEntry]))
@@ -518,7 +567,7 @@ func decmpfsResourceForkOffsetTable0x100(rsrc []byte, cmpType uint32, expectedSi
 			return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): block %d range [%d,%d) out of fork length %d", i, chunkStart, chunkEnd, len(rsrc))
 		}
 		chunk := rsrc[chunkStart:chunkEnd]
-		decoded, err := decmpfsDecodeRsrcOffsetChunk(chunk, cmpType)
+		decoded, err := decmpfsDecodeRsrcOffsetChunkSized(chunk, cmpType, chunkRawBytes(expectedSize, len(out)))
 		if err != nil {
 			return nil, fmt.Errorf("apfs: decmpfs rsrc(offset): block %d: %w", i, err)
 		}
@@ -534,6 +583,23 @@ func decmpfsResourceForkOffsetTable0x100(rsrc []byte, cmpType uint32, expectedSi
 // resource fork (types 8 and 12). The 0xFF passthrough prefix is honoured
 // for both codecs.
 func decmpfsDecodeRsrcOffsetChunk(chunk []byte, cmpType uint32) ([]byte, error) {
+	return decmpfsDecodeRsrcOffsetChunkSized(chunk, cmpType, rsrcMaxChunkSize)
+}
+
+// chunkRawBytes is the number of bytes the next chunk is expected to decode to:
+// a full chunk, or what is left of the declared size for the last one.
+// lzfse v0.6.0 refuses an LZVN block declaring more raw bytes than its payload
+// can encode, so a three-byte final chunk can no longer be declared as 64 KiB.
+func chunkRawBytes(declared uint64, produced int) int {
+	if declared == 0 || declared <= uint64(produced) {
+		return rsrcMaxChunkSize
+	}
+	return int(min(declared-uint64(produced), rsrcMaxChunkSize))
+}
+
+// decmpfsDecodeRsrcOffsetChunkSized is decmpfsDecodeRsrcOffsetChunk for a chunk
+// expected to decode to nRaw bytes (at most rsrcMaxChunkSize).
+func decmpfsDecodeRsrcOffsetChunkSized(chunk []byte, cmpType uint32, nRawBytes int) ([]byte, error) {
 	if len(chunk) == 0 {
 		return nil, nil
 	}
@@ -549,7 +615,7 @@ func decmpfsDecodeRsrcOffsetChunk(chunk []byte, cmpType uint32) ([]byte, error) 
 		// Wrap the raw LZVN payload as a bvxn block + bvx$ trailer so we
 		// can reuse lzfse.Decompress (the package's decoder dispatches on
 		// block magic).
-		nRaw := uint32(rsrcMaxChunkSize)
+		nRaw := uint32(nRawBytes)
 		nPayload := uint32(len(chunk))
 		wrapped := make([]byte, 0, 12+len(chunk)+4)
 		hdr := make([]byte, 12)
@@ -561,13 +627,15 @@ func decmpfsDecodeRsrcOffsetChunk(chunk []byte, cmpType uint32) ([]byte, error) 
 		eos := make([]byte, 4)
 		binary.LittleEndian.PutUint32(eos, lzfseMagicEndOfStreamLE)
 		wrapped = append(wrapped, eos...)
-		out, err := lzfse.Decompress(wrapped)
+		out, err := lzfseDecode(wrapped, rsrcMaxChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("LZVN decode: %w", err)
 		}
 		return out, nil
 	case decmpfsTypeLZFSEResource:
-		out, err := lzfse.Decompress(chunk)
+		// A chunk decodes to at most rsrcMaxChunkSize bytes (as the LZVN case
+		// above already declares), not the 1 GiB default.
+		out, err := lzfseDecode(chunk, rsrcMaxChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("LZFSE decode: %w", err)
 		}
