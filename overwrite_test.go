@@ -197,13 +197,6 @@ func TestOverwriteFile_Grow(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // TestOverwriteFile_GrowMultiExtent grows a file from 100 bytes → 5 KiB
 // (forcing one fresh extent), then grows it again to 12 KiB so the
 // payload now spans THREE extents written across two grow rounds. The

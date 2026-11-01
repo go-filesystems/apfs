@@ -1,5 +1,7 @@
 github.com/go-compressions/lzfse v0.5.0 h1:r4eLxuzXc2C0LYlhhVmtEq0c+B31c53jcaa8UKLbMlk=
 github.com/go-compressions/lzfse v0.5.0/go.mod h1:G4+MZUwHkfTSjCfJyRFJzTdNIy0v+JcehyxvWJTGBE4=
+github.com/go-compressions/lzfse v0.6.0 h1:LXo+b8rphmNHldheGCYUTJ/HPcBCwN+dFY96PzOPouc=
+github.com/go-compressions/lzfse v0.6.0/go.mod h1:M5g2n/8PWC9JCyAPpo18Vcue7q3/yVI5b6txizVaHKo=
 github.com/go-encryptions/xts v0.1.0 h1:/uPOWw21d/yho/o98q6y7yz3O1ijp8rWdBIbeImSveA=
 github.com/go-encryptions/xts v0.1.0/go.mod h1:MpappevOqsWjrgi8lxnzHp1ylO8q8biBVsL0VWHidfQ=
 github.com/go-fde/apfs v0.3.0 h1:KBw5oWMKNGx2AS9g+kC/YZ9qaoCm48/jnad1PieYtx4=

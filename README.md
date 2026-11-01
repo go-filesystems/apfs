@@ -449,6 +449,24 @@ against drift.
   `extentRefInternalCapEntries`) lower the natural per-block byte cap so
   the level-2 path fires under workloads tolerable in CI.
 
+## Untrusted images
+
+An image is attacker-controlled input and every size in it is a claim. Each
+input-driven allocation is bounded before it is made (`bombs_test.go` measures
+each road with `runtime.MemStats`):
+
+| Claim in the image | Bound |
+|---|---|
+| the superblock's `blockCount` (the old ceiling for every file read) | the backing store's real size when it can be told (`os.File`, `bytes.Reader`), the claim only as a last resort |
+| a file's / xattr stream's extents (`ReadFile`, `ReadXAttrStream`) | total backed bytes at most the container size; each extent must lie inside the image; with the size unknown the buffer grows with the bytes the reader delivers |
+| sparse holes and a declared size past the last extent | at most 1 GiB of invented zeros (`safeio.ErrTooLarge`); stream larger sparse files with `FileReaderAt` |
+| decmpfs `uncompressedSize` | at most 1 GiB, and every decoder is bounded by the declared size (+ one 64 KiB chunk): zlib inflate, `lzfse.DecompressLimit` (lzfse v0.6.0) for types 7 and 11, 64 KiB per chunk for types 8 and 12 |
+| decmpfs chunked forks | capacity reserved is at most what the chunks can produce, and decoding stops once the declared size is reached |
+
+Fuzz targets: `FuzzDecmpfsBombs` (asserts a per-input allocation budget) plus
+the existing `FuzzDecmpfs`, `FuzzOpen`, `FuzzReadBTreeNode` and
+`FuzzOpenUnlocked`.
+
 ## Limitations
 
 - Mount-backed `Open` mode is only used on macOS (proxies to

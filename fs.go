@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 
@@ -405,10 +406,17 @@ func (c *Container) containerByteSize() int64 {
 		return bs
 	}
 	// Saturating multiply: if bc*bs overflows int64, clamp to MaxInt64.
-	if bc > math.MaxInt64/bs {
-		return math.MaxInt64
+	claim := int64(math.MaxInt64)
+	if bc <= math.MaxInt64/bs {
+		claim = bc * bs
 	}
-	return bc * bs
+	// blockCount is a number off the disk; the backing store's own size, when
+	// it can be told, is the truth. A superblock claiming 2^40 blocks over a
+	// 1 MiB image used to make 4 PiB the ceiling for every file read.
+	if n := c.imageSize(); n > 0 && n < claim {
+		return n
+	}
+	return claim
 }
 
 // omapLookupRoot returns the physical block of an entry in the container or
@@ -1170,38 +1178,118 @@ func (v *Volume) ReadXAttrStream(x XAttr) ([]byte, error) {
 	sort.Slice(extents, func(i, j int) bool {
 		return extents[i].logicalOffset < extents[j].logicalOffset
 	})
+	out, err := v.assembleExtents(fmt.Sprintf("stream xattr %q", x.Name), extents, 0)
+	if err != nil {
+		return nil, err
+	}
+	if x.StreamSize > 0 && uint64(len(out)) > x.StreamSize {
+		out = out[:x.StreamSize]
+	}
+	return out, nil
+}
+
+// maxZeroFill bounds the bytes ReadFile and ReadXAttrStream will invent: sparse
+// holes and a declared size beyond the last extent read as zeros that no byte of
+// the image backs, so 4 bytes of extent record can name a terabyte. Larger
+// sparse files stream through FileReaderAt / XAttrStreamReaderAt.
+var maxZeroFill int64 = 1 << 30 // a variable so tests can lower it
+
+// imageSize returns the byte size of the backing store, or -1 when it cannot be
+// told (a bare io.ReaderAt, or a block device whose Stat size is zero).
+func (c *Container) imageSize() int64 {
+	switch r := c.r.(type) {
+	case interface{ Size() int64 }:
+		if n := r.Size(); n > 0 {
+			return n
+		}
+	case interface{ Stat() (os.FileInfo, error) }:
+		if fi, err := r.Stat(); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+			return fi.Size()
+		}
+	}
+	return -1
+}
+
+// assembleExtents concatenates a file's (or stream's) extents in logical order,
+// zero-filling sparse holes and, when sizeTail > 0, the stretch between the
+// last extent and sizeTail. Nothing is sized from a claim before it is checked:
+//
+//   - the bytes the image backs (extent lengths) must fit in the container's
+//     size, which is the image's real size when the backend can tell and the
+//     superblock's block count otherwise (an attacker-chosen number);
+//   - an extent must lie inside the image when its size is known;
+//   - the zeros (holes + tail) are capped at maxZeroFill;
+//   - when the image size is unknown the output grows with the bytes the
+//     reader delivers (1 MiB steps, doubling) instead of being reserved from
+//     the extent's claimed length.
+func (v *Volume) assembleExtents(what string, extents []containerExtent, sizeTail uint64) ([]byte, error) {
 	bs := uint64(v.c.sb.blockSize)
 	if bs == 0 {
 		bs = 4096
 	}
-	// Cap every untrusted allocation against the container's byte size. (C3.)
-	maxBytes := v.c.containerByteSize()
+	limit := v.c.containerByteSize()
+	real := v.c.imageSize()
+	zeros := maxZeroFill
+	var backed int64
 	out := make([]byte, 0)
+	pad := func(n uint64) error {
+		if n > uint64(zeros) {
+			return fmt.Errorf("apfs: %s: %d zero bytes (sparse hole or declared size) exceed %d: %w",
+				what, n, maxZeroFill, safeio.ErrTooLarge)
+		}
+		zeros -= int64(n)
+		out = slices.Grow(out, int(n))
+		out = out[:len(out)+int(n)]
+		clear(out[len(out)-int(n):])
+		return nil
+	}
 	var expected uint64
 	for _, ext := range extents {
 		if ext.logicalOffset > expected {
-			pad, err := safeio.MakeBytes(int64(ext.logicalOffset-expected), maxBytes)
-			if err != nil {
-				return nil, fmt.Errorf("apfs: stream xattr %q sparse hole: %w", x.Name, err)
+			if err := pad(ext.logicalOffset - expected); err != nil {
+				return nil, err
 			}
-			out = append(out, pad...)
 			expected = ext.logicalOffset
 		}
 		if ext.logicalOffset < expected {
-			return nil, fmt.Errorf("apfs: stream xattr %q has overlapping extents", x.Name)
+			return nil, fmt.Errorf("apfs: %s has overlapping extents (logical %d, already at %d)", what, ext.logicalOffset, expected)
 		}
-		chunk, err := safeio.MakeBytes(int64(ext.length), maxBytes)
-		if err != nil {
-			return nil, fmt.Errorf("apfs: stream xattr %q extent length: %w", x.Name, err)
+		if ext.length > uint64(limit) || backed+int64(ext.length) > limit {
+			return nil, fmt.Errorf("apfs: %s: extents of %d bytes exceed the container's %d: %w",
+				what, uint64(backed)+ext.length, limit, safeio.ErrTooLarge)
 		}
-		if err := readExtentAt(v.c.r, v.c.fsCrypt, bs, ext, chunk, 0); err != nil {
-			return nil, err
+		if real > 0 {
+			base, err := blockByteOffset(ext.physBlock, bs)
+			if err != nil {
+				return nil, err
+			}
+			if base > real || int64(ext.length) > real-base {
+				return nil, fmt.Errorf("apfs: %s: extent [%d,+%d) outside the %d-byte image: %w",
+					what, base, ext.length, real, safeio.ErrOutOfBounds)
+			}
 		}
-		out = append(out, chunk...)
+		for done := uint64(0); done < ext.length; {
+			step := ext.length - done
+			if real <= 0 {
+				step = min(step, max(uint64(1<<20), uint64(len(out))))
+			}
+			if step > uint64(math.MaxInt) { // a 32-bit target cannot hold it
+				return nil, fmt.Errorf("apfs: %s: extent of %d bytes: %w", what, ext.length, safeio.ErrTooLarge)
+			}
+			old := len(out)
+			out = slices.Grow(out, int(step))[:old+int(step)]
+			if err := readExtentAt(v.c.r, v.c.fsCrypt, bs, ext, out[old:], done); err != nil {
+				return nil, err
+			}
+			done += step
+		}
+		backed += int64(ext.length)
 		expected += ext.length
 	}
-	if x.StreamSize > 0 && uint64(len(out)) > x.StreamSize {
-		out = out[:x.StreamSize]
+	if expected < sizeTail {
+		if err := pad(sizeTail - expected); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -1969,56 +2057,19 @@ func (v *Volume) ReadFile(inode Inode) ([]byte, error) {
 	if inode.IsDir {
 		return nil, fmt.Errorf("apfs: ReadFile on directory %q", inode.Name)
 	}
-	bs := uint64(v.c.sb.blockSize)
-	if bs == 0 {
-		bs = 4096
-	}
-	// Cap every untrusted allocation against the container's byte size: an
-	// inode.Size / ext.length / sparse-hole gap larger than the whole image
-	// is malformed, so reject it rather than attempt a huge make(). (C3.)
-	maxBytes := v.c.containerByteSize()
-	if len(inode.dataExtents) == 0 {
-		// Nothing on disk; honour the logical size with zeros.
-		return safeio.MakeBytes(int64(inode.Size), maxBytes)
-	}
+	// Every untrusted size is checked before it is allocated: the extents
+	// against the image, the zero-filled remainder (sparse holes, the declared
+	// size past the last extent) against maxZeroFill. (C3.)
 	extents := make([]containerExtent, len(inode.dataExtents))
 	copy(extents, inode.dataExtents)
 	sort.Slice(extents, func(i, j int) bool {
 		return extents[i].logicalOffset < extents[j].logicalOffset
 	})
-	out := make([]byte, 0)
-	var expected uint64
-	for _, ext := range extents {
-		if ext.logicalOffset > expected {
-			// Sparse hole: pad with zeros up to the next extent's start.
-			pad, err := safeio.MakeBytes(int64(ext.logicalOffset-expected), maxBytes)
-			if err != nil {
-				return nil, fmt.Errorf("apfs: sparse hole: %w", err)
-			}
-			out = append(out, pad...)
-			expected = ext.logicalOffset
-		}
-		if ext.logicalOffset < expected {
-			return nil, fmt.Errorf("apfs: overlapping extents at logical %d (already at %d)", ext.logicalOffset, expected)
-		}
-		chunk, err := safeio.MakeBytes(int64(ext.length), maxBytes)
-		if err != nil {
-			return nil, fmt.Errorf("apfs: extent length: %w", err)
-		}
-		if err := readExtentAt(v.c.r, v.c.fsCrypt, bs, ext, chunk, 0); err != nil {
-			return nil, err
-		}
-		out = append(out, chunk...)
-		expected += ext.length
-	}
-	// Trailing zero region (size declared in the inode but not covered by
-	// any extent) — zero-fill or truncate as appropriate.
-	if expected < inode.Size {
-		pad, err := safeio.MakeBytes(int64(inode.Size-expected), maxBytes)
-		if err != nil {
-			return nil, fmt.Errorf("apfs: trailing zero region: %w", err)
-		}
-		out = append(out, pad...)
+	// Trailing zero region (size declared in the inode but not covered by any
+	// extent) is zero-filled by assembleExtents; a longer read is truncated.
+	out, err := v.assembleExtents("file", extents, inode.Size)
+	if err != nil {
+		return nil, err
 	}
 	if uint64(len(out)) > inode.Size {
 		out = out[:inode.Size]
