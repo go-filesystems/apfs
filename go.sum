@@ -1,5 +1,3 @@
-github.com/go-compressions/lzfse v0.5.0 h1:r4eLxuzXc2C0LYlhhVmtEq0c+B31c53jcaa8UKLbMlk=
-github.com/go-compressions/lzfse v0.5.0/go.mod h1:G4+MZUwHkfTSjCfJyRFJzTdNIy0v+JcehyxvWJTGBE4=
 github.com/go-compressions/lzfse v0.6.0 h1:LXo+b8rphmNHldheGCYUTJ/HPcBCwN+dFY96PzOPouc=
 github.com/go-compressions/lzfse v0.6.0/go.mod h1:M5g2n/8PWC9JCyAPpo18Vcue7q3/yVI5b6txizVaHKo=
 github.com/go-encryptions/xts v0.1.0 h1:/uPOWw21d/yho/o98q6y7yz3O1ijp8rWdBIbeImSveA=
@@ -10,8 +8,8 @@ github.com/go-filesystems/interface v0.5.0 h1:AsbSXYG5cp497Ki0Ez88s8wwrVEmeRmFLd
 github.com/go-filesystems/interface v0.5.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
 github.com/go-volumes/gpt v0.3.0/go.mod h1:Dha6JL5/mGyDai8tWvZOPYn6pqe75NOtMRYGm3N4Qv8=
-github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b h1:t1KQDKjOZ8ID/lZu0afPACvb5drgOpcHp1ATJS0do/A=
-github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
+github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39 h1:fwjxetvgv6Q6w60Pn94WolICFLFP/dfPXcjKrGKPI18=
+github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
 golang.org/x/crypto v0.58.0 h1:COkYLr4k7nDI4r6QtMML2AfzeIswWHAJthLS6K/M/54=
 golang.org/x/crypto v0.58.0/go.mod h1:Xh+kl5A+M0gMiWDytH2Hhr5Z7WbNCpv/eB/EFgfSk+w=
 golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
