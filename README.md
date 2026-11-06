@@ -57,6 +57,12 @@ These wrap a `*Container` + first `*Volume` in a path-based `driver`
 satisfying `pkg/go-filesystems/interface.Filesystem`. They are what
 `pkg/go-diskimages/diskimage` and other callers consume.
 
+The driver also implements `filesystem.Opener`: `OpenFile(path)` returns a `File`
+whose `ReadAt` reads only the extents of its window (holes as zeros), so a server
+answering a READ of a few bytes of a large file does not load it whole. A 1 MiB
+read at 66 MiB of a 72 MiB file allocates nothing through it and 75 MB through
+`ReadFile`.
+
 | Entry point | Purpose |
 | --- | --- |
 | `Open(imagePath, partIndex)` | Open a real APFS container. On macOS, falls back to `hdiutil attach` if the path isn't a parseable container. |
