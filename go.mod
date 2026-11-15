@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/go-compressions/lzfse v0.6.0
-	github.com/go-fde/apfs v0.3.0
+	github.com/go-fde/apfs v0.3.1
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-volumes/gpt v0.3.0
 	github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39
@@ -12,6 +12,6 @@ require (
 )
 
 require (
-	github.com/go-encryptions/xts v0.1.0 // indirect
+	github.com/go-encryptions/xts v0.3.1 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 )
