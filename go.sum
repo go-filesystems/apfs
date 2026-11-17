@@ -1,9 +1,11 @@
 github.com/go-compressions/lzfse v0.6.0 h1:LXo+b8rphmNHldheGCYUTJ/HPcBCwN+dFY96PzOPouc=
 github.com/go-compressions/lzfse v0.6.0/go.mod h1:M5g2n/8PWC9JCyAPpo18Vcue7q3/yVI5b6txizVaHKo=
-github.com/go-encryptions/xts v0.1.0 h1:/uPOWw21d/yho/o98q6y7yz3O1ijp8rWdBIbeImSveA=
-github.com/go-encryptions/xts v0.1.0/go.mod h1:MpappevOqsWjrgi8lxnzHp1ylO8q8biBVsL0VWHidfQ=
-github.com/go-fde/apfs v0.3.0 h1:KBw5oWMKNGx2AS9g+kC/YZ9qaoCm48/jnad1PieYtx4=
-github.com/go-fde/apfs v0.3.0/go.mod h1:TO2peiXxBB8bmZgX/cuyRD10YGSix/I07yhZ+lCzXvY=
+github.com/go-encryptions/twofish v0.1.1 h1:yaAH2Y/PIDRg8v/+qDMsoW11v+9N7zXjli4TLU8wko8=
+github.com/go-encryptions/twofish v0.1.1/go.mod h1:TQNErsH00Wkl6uXzVaJ7dyb3c7hN2vXhkV88XWEG6SU=
+github.com/go-encryptions/xts v0.3.1 h1:3ygCAZj3jRDMF3+Xtb572er7bLDk4tQ6lX9pg+Wl1xk=
+github.com/go-encryptions/xts v0.3.1/go.mod h1:4nI556Nyeap1LnZbEckm+/ljpXPCdUPY4lXv6aWTakI=
+github.com/go-fde/apfs v0.3.1 h1:grngIOpHx0IdwIbgerY5SwyGRhaw3ienUYEvQRub0ng=
+github.com/go-fde/apfs v0.3.1/go.mod h1:24Juxl0wryg/MsrNQcvy/7QQ7VLG/rZPb4HJAz71rcs=
 github.com/go-filesystems/interface v0.6.0 h1:+7nA5FHgs/B03rZ9p81bkm0+6ew9fEntTFK8L5Uu6pk=
 github.com/go-filesystems/interface v0.6.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
