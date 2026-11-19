@@ -1,6 +1,6 @@
 module github.com/go-filesystems/apfs
 
-go 1.27.1
+go 1.27.4
 
 require (
 	github.com/go-compressions/lzfse v0.6.0
