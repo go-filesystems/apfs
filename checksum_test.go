@@ -215,6 +215,25 @@ func TestAllCheckpointsCorruptIsTypedError(t *testing.T) {
 	}
 }
 
+func TestVerifyObjectBlockShortAndExact(t *testing.T) {
+	var ce *ChecksumError
+	err := verifyObjectBlock(7, make([]byte, objPhysSize-1))
+	if err == nil || errors.As(err, &ce) {
+		t.Fatalf("short block: want a plain error, got %v", err)
+	}
+	// Exactly objPhysSize bytes: the header alone is a complete block.
+	b := make([]byte, objPhysSize)
+	sealBlock(b)
+	if err := verifyObjectBlock(7, b); err != nil {
+		t.Fatalf("sealed %d-byte block refused: %v", objPhysSize, err)
+	}
+	b[20] ^= 1
+	err = verifyObjectBlock(7, b)
+	if !errors.As(err, &ce) || ce.Block != 7 || ce.Stored == ce.Computed {
+		t.Fatalf("want *ChecksumError for block 7, got %v", err)
+	}
+}
+
 // Read-path allocation and time baseline (go test -bench ReadPath -benchmem).
 func BenchmarkReadPath(b *testing.B) {
 	img := filepath.Join(b.TempDir(), "img")
