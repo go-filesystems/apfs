@@ -268,3 +268,21 @@ func TestReadBlockRefusals(t *testing.T) {
 		t.Fatalf("zero block under IgnoreChecksums: %v", err)
 	}
 }
+
+// A genuine image opens through the pure-Go reader (never the hdiutil driver),
+// with and without keys.
+func TestOpenWithKeysGenuineImageUsesPureGoReader(t *testing.T) {
+	img := checksumImage(t)
+	fsys, err := OpenWithKeys(img, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsys.Close()
+	if _, isDriver := fsys.(*driver); isDriver {
+		t.Fatal("genuine image went through the hdiutil fall-back")
+	}
+	ents, err := fsys.ListDir("/")
+	if err != nil || len(ents) != 1 || ents[0].Name() != "hello.txt" {
+		t.Fatalf("ListDir: %v %v", ents, err)
+	}
+}
