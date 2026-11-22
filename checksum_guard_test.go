@@ -67,6 +67,12 @@ func TestOpenReadErrorsAreRefusedNotFallenBack(t *testing.T) {
 	// Container omap block unreadable.
 	_, err = OpenContainerFromBackend(&flakyReader{data: raw, failOff: int64(sb.omapOID) * 4096, failFrom: 1})
 	notChecksum(t, err, "read container omap")
+	// Block 0 that is not an NX superblock is refused by the parser.
+	junk := append([]byte(nil), raw...)
+	junk[24] = 0xFF
+	sealBlock(junk[:4096])
+	_, err = OpenContainerFromBackend(bytes.NewReader(junk))
+	notChecksum(t, err, "NX SB")
 	// Control: the same backend with no failure opens.
 	c, err := OpenContainerFromBackend(&flakyReader{data: raw, failOff: -1})
 	if err != nil {
@@ -151,13 +157,20 @@ func TestOpenOptionsFileErrors(t *testing.T) {
 	}
 	// GPT signature with a truncated header: refused, never read as APFS.
 	bad := filepath.Join(t.TempDir(), "gpt")
-	buf := make([]byte, 1024)
-	copy(buf[512:], "EFI PART")
+	buf := make([]byte, 1<<16)
+	hdr := buf[gptSectorSize : 2*gptSectorSize]
+	copy(hdr[0:8], "EFI PART")
+	binary.LittleEndian.PutUint64(hdr[0x48:0x50], 2)
+	binary.LittleEndian.PutUint32(hdr[0x50:0x54], 128)
+	binary.LittleEndian.PutUint32(hdr[0x54:0x58], 0) // entry size 0: malformed
 	if err := os.WriteFile(bad, buf, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenContainerOptions(bad, Options{}); err == nil {
-		t.Fatal("malformed GPT opened")
+	if _, err := OpenContainerOptions(bad, Options{}); err == nil || !strings.Contains(err.Error(), "gpt") {
+		t.Fatalf("malformed GPT: want a gpt error, got %v", err)
+	}
+	if _, err := OpenContainerRWOptions(bad, Options{}); err == nil || !strings.Contains(err.Error(), "gpt") {
+		t.Fatalf("malformed GPT (rw): want a gpt error, got %v", err)
 	}
 	// RW open of a valid image works and keeps its writer.
 	c, err := OpenContainerRWOptions(checksumImage(t), Options{})
@@ -240,8 +253,8 @@ func TestReadBlockRefusals(t *testing.T) {
 	defer c.Close()
 	// Past the end of the backend: a plain read error, not a checksum error.
 	_, err = c.readBlock(uint64(len(raw))/4096 + 10)
-	if err == nil || errors.Is(err, ErrChecksum) {
-		t.Fatalf("beyond EOF: %v", err)
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("beyond EOF: want the backend's read error, got %v", err)
 	}
 	// An all-zero block fails the checksum unless verification is off.
 	zeroRaw := make([]byte, 4096*8)
