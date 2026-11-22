@@ -278,7 +278,7 @@ func TestOpenWithKeysGenuineImageUsesPureGoReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fsys.Close()
-	if _, isDriver := fsys.(*driver); isDriver {
+	if d, ok := fsys.(*driver); !ok || d.c == nil || d.mountpoint != "" {
 		t.Fatal("genuine image went through the hdiutil fall-back")
 	}
 	ents, err := fsys.ListDir("/")
