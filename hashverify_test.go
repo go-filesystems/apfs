@@ -35,6 +35,10 @@ func buildSealedFSTreeImage(t *testing.T) []byte {
 	})
 	// Compute the SHA-256 of each child leaf AFTER it has been written —
 	// this is the value the parent's hashed entries must carry.
+	// The leaves are sealed first: the hash covers the block as stored,
+	// o_cksum included.
+	sealBlock(img.blocks[7])
+	sealBlock(img.blocks[8])
 	hash1 := sha256.Sum256(img.blocks[7])
 	hash2 := sha256.Sum256(img.blocks[8])
 	writeFSTreeInternalHashed(img.blocks[6], []fsHashedEntry{
@@ -103,6 +107,7 @@ func TestHashVerify_DetectsCorruption(t *testing.T) {
 			t.Fatalf("OpenContainerFromBackend: %v", err)
 		}
 		defer c.Close()
+		c.SetIgnoreChecksums(true) // isolate the hash layer from o_cksum
 		v, err := c.OpenVolume(0)
 		if err != nil {
 			t.Fatalf("OpenVolume: %v", err)
@@ -123,6 +128,7 @@ func TestHashVerify_DetectsCorruption(t *testing.T) {
 		}
 		defer c.Close()
 		c.SetVerifyHashes(true)
+		c.SetIgnoreChecksums(true) // isolate the hash layer from o_cksum
 		v, err := c.OpenVolume(0)
 		if err != nil {
 			t.Fatalf("OpenVolume: %v", err)

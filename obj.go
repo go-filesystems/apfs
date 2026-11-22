@@ -40,9 +40,8 @@ const objPhysSize = 32
 
 // objPhys is the 32-byte object header that prefixes every APFS object.
 //
-//	uint64 o_cksum   (Fletcher64 of the rest of the block, computed by Apple
-//	                  but NOT verified by this package; APFS allows zero on
-//	                  ephemeral objects)
+//	uint64 o_cksum   (Fletcher64 of the rest of the block; verified on every
+//	                  object read by readBlock, see checksum.go)
 //	uint64 o_oid     (object ID)
 //	uint64 o_xid     (transaction ID)
 //	uint16 o_type

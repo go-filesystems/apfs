@@ -44,9 +44,19 @@ func newContainerImage() *containerImage {
 	return img
 }
 
+// bytes concatenates the blocks, sealing the o_cksum of every block that
+// carries an object header (the reader verifies it, as the Apple File System
+// Reference requires). Blocks of any other kind (file payload) are untouched.
 func (i *containerImage) bytes() []byte {
 	out := make([]byte, 0, 8*4096)
 	for _, b := range i.blocks {
+		if len(b) >= objPhysSize {
+			switch binary.LittleEndian.Uint16(b[24:26]) & 0x00FF {
+			case uint16(objTypeNXSuperblock), uint16(objTypeBTree), uint16(objTypeBTreeNode),
+				uint16(objTypeSpaceman), uint16(objTypeOMAP), uint16(objTypeAPFSVolume):
+				sealBlock(b)
+			}
+		}
 		out = append(out, b...)
 	}
 	return out

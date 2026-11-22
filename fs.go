@@ -153,6 +153,9 @@ type Container struct {
 	// the object maps flag OMAP_VAL_ENCRYPTED and file-extent reads decrypt
 	// extents with a crypto_id. Everything else is read raw. See fde_crypt.go.
 	fsCrypt *fsCrypt
+	// ignoreChecksums disables o_cksum verification in readBlock (forensic
+	// opt-out, Options.IgnoreChecksums). Off by default.
+	ignoreChecksums bool
 }
 
 // readFSChildBlock resolves a virtual child OID stored in entry idx of
@@ -319,30 +322,7 @@ func OpenContainerFromBackend(r containerReader) (*Container, error) {
 }
 
 func openContainerFrom(r containerReader, closer func() error) (*Container, error) {
-	const block0Size = 4096
-	block := make([]byte, block0Size)
-	if _, err := r.ReadAt(block, 0); err != nil {
-		return nil, fmt.Errorf("apfs: read block 0: %w", err)
-	}
-	sb, err := readNXSuperblock(block)
-	if err != nil {
-		return nil, err
-	}
-	c := &Container{r: r, closer: closer, sb: sb}
-	// Resolve the container object map. The omap_oid in the NX superblock
-	// is a "physical oid" by Apple's typing rules: it IS the block address.
-	if sb.omapOID != 0 {
-		omapBlock, err := c.readBlock(sb.omapOID)
-		if err != nil {
-			return nil, fmt.Errorf("apfs: read container omap: %w", err)
-		}
-		om, err := readOmapPhys(omapBlock)
-		if err != nil {
-			return nil, err
-		}
-		c.containerOmap = om
-	}
-	return c, nil
+	return openContainerFromOpts(r, closer, Options{})
 }
 
 // Close releases the underlying file descriptor when one was opened by
@@ -368,9 +348,26 @@ func (c *Container) Volumes() []VolumeInfo {
 	return out
 }
 
-// readBlock reads exactly one container block at logical (physical) block
-// number bn.
+// readBlock reads one container block holding an APFS object and verifies its
+// Fletcher-64 o_cksum (unless Options.IgnoreChecksums), returning a
+// *ChecksumError on mismatch. For blocks that are not objects (raw bitmaps),
+// use readBlockRaw.
 func (c *Container) readBlock(bn uint64) ([]byte, error) {
+	buf, err := c.readBlockRaw(bn)
+	if err != nil {
+		return nil, err
+	}
+	if !c.ignoreChecksums {
+		if err := verifyObjectBlock(bn, buf); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+// readBlockRaw reads exactly one container block at logical (physical) block
+// number bn, decrypting it when the volume key says so, without any checksum.
+func (c *Container) readBlockRaw(bn uint64) ([]byte, error) {
 	bs := int(c.sb.blockSize)
 	if bs == 0 {
 		bs = 4096

@@ -80,9 +80,21 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 // volume; GPT-partitioned images are handled transparently by
 // OpenContainerAuto in fs.go).
 func Open(imagePath string, partIndex int) (filesystem.Filesystem, error) {
+	return OpenWithOptions(imagePath, partIndex, Options{})
+}
+
+// OpenWithOptions is Open with Options (see Options.IgnoreChecksums). A
+// container that fails its object checksums is refused with a *ChecksumError
+// (errors.As, or errors.Is(err, ErrChecksum)); the darwin hdiutil fall-back is
+// not tried, since the pure-Go reader did recognise the container.
+func OpenWithOptions(imagePath string, partIndex int, opts Options) (filesystem.Filesystem, error) {
 	_ = partIndex
-	if fs, err := openContainerAsFilesystem(imagePath, nil); err == nil {
+	fs, err := openContainerAsFilesystemOpts(imagePath, nil, opts)
+	if err == nil {
 		return fs, nil
+	}
+	if errors.Is(err, ErrChecksum) {
+		return nil, err
 	}
 	if runtime.GOOS == "darwin" {
 		mnt, dev, merr := attachImage(imagePath)
@@ -100,8 +112,12 @@ func Open(imagePath string, partIndex int) (filesystem.Filesystem, error) {
 func OpenWithKeys(imagePath string, partIndex int, keys ...string) (filesystem.Filesystem, error) {
 	_ = partIndex
 	// Try unencrypted real APFS first.
-	if fs, err := openContainerAsFilesystem(imagePath, nil); err == nil {
+	fs, err := openContainerAsFilesystem(imagePath, nil)
+	if err == nil {
 		return fs, nil
+	}
+	if errors.Is(err, ErrChecksum) {
+		return nil, err
 	}
 	// Try FileVault FDE with each supplied passphrase.
 	for _, k := range keys {
@@ -123,15 +139,19 @@ func OpenWithKeys(imagePath string, partIndex int, keys ...string) (filesystem.F
 // passphrase is non-nil, the container is treated as FileVault-
 // encrypted; otherwise unencrypted APFS is assumed.
 func openContainerAsFilesystem(path string, passphrase []byte) (filesystem.Filesystem, error) {
+	return openContainerAsFilesystemOpts(path, passphrase, Options{})
+}
+
+func openContainerAsFilesystemOpts(path string, passphrase []byte, opts Options) (filesystem.Filesystem, error) {
 	if passphrase != nil {
 		// FileVault-encrypted path. apfs_fde.go::OpenFDE returns a
 		// driver bound to the decrypted container.
 		return openEncryptedFilesystem(path, passphrase)
 	}
-	c, err := OpenContainerRWAuto(path)
+	c, err := OpenContainerRWOptions(path, opts)
 	if err != nil {
 		// Read-only fallback for non-writable images.
-		ro, roerr := OpenContainerAuto(path)
+		ro, roerr := OpenContainerOptions(path, opts)
 		if roerr != nil {
 			return nil, err
 		}

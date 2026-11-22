@@ -387,11 +387,23 @@ func encodeObjHeader(buf []byte, oid, xid uint64, typ uint16, subtype uint32, st
 // sealBlock takes care of the slicing.
 func fletcher64(buf []byte) uint64 {
 	const mod = uint64(0xFFFFFFFF)
+	// The reduction modulo 2^32-1 is deferred to every 1024 words: s1 then
+	// stays below 2^42 and s2 below 2^52, so nothing overflows and the result
+	// equals reducing after every word.
+	const run = 1024 * 4
 	var s1, s2 uint64
-	for i := 0; i+4 <= len(buf); i += 4 {
-		v := uint64(binary.LittleEndian.Uint32(buf[i : i+4]))
-		s1 = (s1 + v) % mod
-		s2 = (s2 + s1) % mod
+	for len(buf) >= 4 {
+		n := len(buf) &^ 3
+		if n > run {
+			n = run
+		}
+		for i := 0; i < n; i += 4 {
+			s1 += uint64(binary.LittleEndian.Uint32(buf[i : i+4]))
+			s2 += s1
+		}
+		s1 %= mod
+		s2 %= mod
+		buf = buf[n:]
 	}
 	c1 := mod - ((s1 + s2) % mod)
 	c2 := mod - ((s1 + c1) % mod)

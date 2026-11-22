@@ -62,6 +62,15 @@ func FuzzOpen(f *testing.F) {
 		corrupt[32] ^= 0xFF
 		f.Add(corrupt)
 	}
+	// Checksum seeds: one payload byte flipped in block 0 (checkpoint
+	// fall-back path) and in later object blocks (ChecksumError path).
+	for _, off := range []int{200, 4096*2 + 100, 4096*3 + 100, 4096*66 + 100} {
+		if off < len(seedBytes) {
+			bad := append([]byte(nil), seedBytes...)
+			bad[off] ^= 0x01
+			f.Add(bad)
+		}
+	}
 	// Hardening seeds: poison the NX block size (H2) — 0 and a huge value.
 	if len(seedBytes) >= 40 {
 		zeroBS := append([]byte(nil), seedBytes...)

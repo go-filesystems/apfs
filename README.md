@@ -469,6 +469,28 @@ each road with `runtime.MemStats`):
 | decmpfs `uncompressedSize` | at most 1 GiB, and every decoder is bounded by the declared size (+ one 64 KiB chunk): zlib inflate, `lzfse.DecompressLimit` (lzfse v0.6.0) for types 7 and 11, 64 KiB per chunk for types 8 and 12 |
 | decmpfs chunked forks | capacity reserved is at most what the chunks can produce, and decoding stops once the declared size is reached |
 
+### Object checksums
+
+Every object read verifies `obj_phys_t.o_cksum`, the Fletcher-64 of the block
+after its first 8 bytes (Apple File System Reference, "Objects" and "Fletcher 64
+Checksum Algorithm"). A mismatch is a `*ChecksumError` (`errors.As`; also
+`errors.Is(err, ErrChecksum)`), never a panic, and `Open` returns it instead of
+falling back to `hdiutil`. A tampered image is therefore no longer served as
+genuine, and a later write can no longer re-seal checksums over tampered blocks.
+
+If the container superblock at block 0 (or the container object map) fails its
+checksum, the reader follows "Mounting an Apple File System Partition": it scans
+the checkpoint descriptor area and mounts the newest superblock whose checksum
+verifies. The area must be contiguous; if no checkpoint verifies, the error is
+the `*ChecksumError` of block 0.
+
+Forensic opt-out, off by default: `Options{IgnoreChecksums: true}` with
+`OpenWithOptions`, `OpenContainerOptions` or `OpenContainerRWOptions`, or
+`Container.SetIgnoreChecksums(true)`. With it on, damaged data is served as is.
+Not covered: the FileVault open path (`OpenFDE*`) verifies but has no opt-out
+yet. File data and the space manager's bitmaps are not objects and carry no
+checksum.
+
 Fuzz targets: `FuzzDecmpfsBombs` (asserts a per-input allocation budget) plus
 the existing `FuzzDecmpfs`, `FuzzOpen`, `FuzzReadBTreeNode` and
 `FuzzOpenUnlocked`.
