@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
+	"github.com/go-simd/adler32/fletcher64"
 )
 
 // ErrChecksum is the sentinel every checksum failure matches with errors.Is.
@@ -65,7 +67,7 @@ func verifyObjectBlock(bn uint64, block []byte) error {
 		return fmt.Errorf("apfs: object at block %d: short block (%d bytes)", bn, len(block))
 	}
 	stored := binary.LittleEndian.Uint64(block[0:8])
-	if got := fletcher64(block[8:]); got != stored {
+	if got := fletcher64.Sum(block[8:]); got != stored {
 		return &ChecksumError{Block: bn, Stored: stored, Computed: got}
 	}
 	return nil

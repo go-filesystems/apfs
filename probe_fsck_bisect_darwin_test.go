@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	apfsfde "github.com/go-fde/apfs"
+	"github.com/go-simd/adler32/fletcher64"
 	"golang.org/x/crypto/xts"
 )
 
@@ -187,7 +188,7 @@ func applyKeybagMutation(path string, fn func([]byte), skipReseal bool) error {
 		for i := 0; i < 8; i++ {
 			plain[i] = 0
 		}
-		cksum := fletcher64(plain[8:])
+		cksum := fletcher64.Sum(plain[8:])
 		binary.LittleEndian.PutUint64(plain[0:8], cksum)
 	}
 

@@ -473,7 +473,9 @@ each road with `runtime.MemStats`):
 
 Every object read verifies `obj_phys_t.o_cksum`, the Fletcher-64 of the block
 after its first 8 bytes (Apple File System Reference, "Objects" and "Fletcher 64
-Checksum Algorithm"). A mismatch is a `*ChecksumError` (`errors.As`; also
+Checksum Algorithm"), computed by the fleet's one kernel,
+[`github.com/go-simd/adler32/fletcher64`](https://github.com/go-simd/adler32/tree/main/fletcher64).
+A mismatch is a `*ChecksumError` (`errors.As`; also
 `errors.Is(err, ErrChecksum)`), never a panic, and `Open` returns it instead of
 falling back to `hdiutil`. A tampered image is therefore no longer served as
 genuine, and a later write can no longer re-seal checksums over tampered blocks.
