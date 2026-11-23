@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/go-simd/adler32/fletcher64"
 )
 
 // fletcher64Ref is the straightforward reduce-after-every-word form of the
 // algorithm in the Apple File System Reference ("Fletcher 64 Checksum
-// Algorithm"); fletcher64 defers the reduction and must agree with it.
+// Algorithm"); the shared kernel defers the reduction and must agree with it.
 func fletcher64Ref(buf []byte) uint64 {
 	const mod = uint64(0xFFFFFFFF)
 	var s1, s2 uint64
@@ -24,18 +26,44 @@ func fletcher64Ref(buf []byte) uint64 {
 	return (c2 << 32) | c1
 }
 
+// TestObjectChecksumIsTheSharedKernel is the regression test for moving the
+// kernel to github.com/go-simd/adler32/fletcher64: a block sealed by this
+// package carries exactly the o_cksum the pre-move local kernel produced (the
+// known answer for the byte(i*7+3) pattern over 4088 bytes, taken from
+// v0.7.0), and verifyObjectBlock accepts it.
+func TestObjectChecksumIsTheSharedKernel(t *testing.T) {
+	block := make([]byte, 4096)
+	for i := 8; i < len(block); i++ {
+		block[i] = byte((i-8)*7 + 3)
+	}
+	sealBlock(block)
+	if got, want := binary.LittleEndian.Uint64(block[0:8]), uint64(0x1c193445c3b48774); got != want {
+		t.Fatalf("sealed o_cksum = %#016x, want %#016x (the v0.7.0 kernel's)", got, want)
+	}
+	if got := fletcher64.Sum(block[8:]); got != binary.LittleEndian.Uint64(block[0:8]) {
+		t.Fatalf("shared kernel %#016x disagrees with the sealed o_cksum", got)
+	}
+	if err := verifyObjectBlock(0, block); err != nil {
+		t.Fatalf("a freshly sealed block must verify: %v", err)
+	}
+	block[100] ^= 1
+	if err := verifyObjectBlock(0, block); err == nil {
+		t.Fatal("a flipped bit must fail verification")
+	}
+}
+
 func TestFletcher64MatchesReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for _, n := range []int{0, 3, 4, 8, 4088, 4096, 4100, 16384, 65528} {
 		b := make([]byte, n)
 		rng.Read(b)
-		if got, want := fletcher64(b), fletcher64Ref(b); got != want {
+		if got, want := fletcher64.Sum(b), fletcher64Ref(b); got != want {
 			t.Fatalf("len %d: %#x != %#x", n, got, want)
 		}
 		for i := range b {
 			b[i] = 0xFF // worst case for overflow of the deferred sums
 		}
-		if got, want := fletcher64(b), fletcher64Ref(b); got != want {
+		if got, want := fletcher64.Sum(b), fletcher64Ref(b); got != want {
 			t.Fatalf("len %d (0xFF): %#x != %#x", n, got, want)
 		}
 	}
@@ -270,6 +298,6 @@ func BenchmarkFletcher64Block(b *testing.B) {
 	rand.New(rand.NewSource(2)).Read(buf)
 	b.SetBytes(int64(len(buf)))
 	for i := 0; i < b.N; i++ {
-		_ = fletcher64(buf)
+		_ = fletcher64.Sum(buf)
 	}
 }
