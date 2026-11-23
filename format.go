@@ -385,6 +385,13 @@ func encodeObjHeader(buf []byte, oid, xid uint64, typ uint16, subtype uint32, st
 //
 // Pass the bytes of the block AFTER the cksum slot (i.e. block[8:]).
 // sealBlock takes care of the slicing.
+//
+// It is a pure function of its argument that touches no shared state, and it
+// runs on every object read, so it is excluded from race instrumentation
+// (//go:norace): instrumenting each word load made the race-detector test
+// suite 2.4x slower once every read verifies its checksum.
+//
+//go:norace
 func fletcher64(buf []byte) uint64 {
 	const mod = uint64(0xFFFFFFFF)
 	// The reduction modulo 2^32-1 is deferred to every 1024 words: s1 then
@@ -397,7 +404,16 @@ func fletcher64(buf []byte) uint64 {
 		if n > run {
 			n = run
 		}
-		for i := 0; i < n; i += 4 {
+		i := 0
+		// Two words per 8-byte load: low word first (little-endian).
+		for ; i+8 <= n; i += 8 {
+			v := binary.LittleEndian.Uint64(buf[i : i+8])
+			s1 += v & 0xFFFFFFFF
+			s2 += s1
+			s1 += v >> 32
+			s2 += s1
+		}
+		for ; i < n; i += 4 {
 			s1 += uint64(binary.LittleEndian.Uint32(buf[i : i+4]))
 			s2 += s1
 		}

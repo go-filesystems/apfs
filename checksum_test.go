@@ -264,3 +264,12 @@ func BenchmarkReadPath(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkFletcher64Block(b *testing.B) {
+	buf := make([]byte, 4088)
+	rand.New(rand.NewSource(2)).Read(buf)
+	b.SetBytes(int64(len(buf)))
+	for i := 0; i < b.N; i++ {
+		_ = fletcher64(buf)
+	}
+}
