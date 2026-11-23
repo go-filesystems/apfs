@@ -1282,7 +1282,7 @@ func (c *Container) locateChunkZero() (*chunkZeroLocation, error) {
 	if bitmapPaddr == 0 || chunkBlocks == 0 {
 		return nil, nil
 	}
-	bitmap, err := c.readBlock(bitmapPaddr)
+	bitmap, err := c.readBlockRaw(bitmapPaddr) // a raw bitmap, not an object: no o_cksum
 	if err != nil {
 		return nil, fmt.Errorf("apfs: alloc: read chunk bitmap at paddr %d: %w", bitmapPaddr, err)
 	}

@@ -117,26 +117,7 @@ func (o *offsetWriter) WriteAt(p []byte, off int64) (int, error) {
 // you don't know up-front whether you're looking at the output of our
 // `FormatContainer` (naked) or Apple's `hdiutil create -fs APFS` (GPT).
 func OpenContainerAuto(path string) (*Container, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("apfs: open %s: %w", path, err)
-	}
-	off, err := findAPFSPartitionOffset(f)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	var r containerReader = f
-	if off != 0 {
-		r = &offsetReader{inner: f, offset: off}
-	}
-	c, err := openContainerFrom(r, f.Close)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	c.w = nil
-	return c, nil
+	return OpenContainerOptions(path, Options{})
 }
 
 // OpenContainerRWAuto is OpenContainerAuto with read+write capability.
@@ -144,27 +125,5 @@ func OpenContainerAuto(path string) (*Container, error) {
 // the Apple_APFS partition; the GPT header and protective MBR are
 // untouched (writes outside the APFS partition would corrupt them).
 func OpenContainerRWAuto(path string) (*Container, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("apfs: rw open %s: %w", path, err)
-	}
-	off, err := findAPFSPartitionOffset(f)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	var r containerReader = f
-	var w containerWriter = f
-	if off != 0 {
-		or := &offsetReader{inner: f, offset: off}
-		r = or
-		w = &offsetWriter{offsetReader: or, innerW: f}
-	}
-	c, err := openContainerFrom(r, f.Close)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	c.w = w
-	return c, nil
+	return OpenContainerRWOptions(path, Options{})
 }
